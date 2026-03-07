@@ -44,7 +44,17 @@ logging.basicConfig(
 log = logging.getLogger("ptt")
 
 # --- Config ---
-DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+MODELS = {
+    "turbo": {
+        "repo": "mlx-community/whisper-large-v3-turbo",
+        "label": "Turbo (snabb, bra)",
+    },
+    "kb-sv": {
+        "repo": "bratland/kb-whisper-large-mlx",
+        "label": "KB Swedish (bast svenska, langsammare)",
+    },
+}
+DEFAULT_MODEL_KEY = "turbo"
 DEFAULT_LANG = "sv"
 SAMPLE_RATE = 16000
 BLOCK_DURATION = 0.1
@@ -154,8 +164,9 @@ def paste_text(text: str):
 
 
 class PTTApp:
-    def __init__(self, model: str, language: str, hotkey: str, device: int | None):
-        self.model = model
+    def __init__(self, model_key: str, language: str, hotkey: str, device: int | None):
+        self.model_key = model_key
+        self.model = MODELS[model_key]["repo"]
         self.language = language
         self.hotkey = hotkey
         self.hotkey_code = KEYCODES.get(hotkey, 61)
@@ -195,10 +206,22 @@ class PTTApp:
             callback=self._toggle_language,
         )
 
+        # Model submenu
+        self._model_menu = rumps.MenuItem("Modell")
+        self._model_items = {}
+        for key, info in MODELS.items():
+            item = rumps.MenuItem(info["label"], callback=self._switch_model)
+            item._model_key = key
+            if key == self.model_key:
+                item.state = 1  # checkmark
+            self._model_items[key] = item
+            self._model_menu.add(item)
+
         self._app.menu = [
             self._status_item,
             None,
             self._lang_item,
+            self._model_menu,
             rumps.MenuItem("Kalibrera mikrofon", callback=self._recalibrate_cb),
             None,
             rumps.MenuItem("Visa logg", callback=self._open_log),
@@ -455,6 +478,39 @@ class PTTApp:
 
     # --- Menu callbacks ---
 
+    def _switch_model(self, sender):
+        key = sender._model_key
+        if key == self.model_key:
+            return
+        self.model_key = key
+        self.model = MODELS[key]["repo"]
+        # Update checkmarks
+        for k, item in self._model_items.items():
+            item.state = 1 if k == key else 0
+        log.info("Switching model to: %s (%s)", key, self.model)
+        self._notify("Modell", MODELS[key]["label"])
+
+        # Pre-load model in background
+        def preload():
+            self._set_title("⏳")
+            self._set_status("Laddar modell...")
+            try:
+                import mlx_whisper
+                mlx_whisper.transcribe(
+                    np.zeros(SAMPLE_RATE, dtype=np.float32),
+                    path_or_hf_repo=self.model,
+                    language=self.language,
+                )
+                log.info("Model %s loaded", key)
+                self._set_status(f"Mic: {self.device_name}")
+                self._notify("Modell laddad", MODELS[key]["label"])
+            except Exception as e:
+                log.error("Model load failed: %s", e)
+                self._notify("Fel", str(e))
+            self._set_title("◉")
+
+        threading.Thread(target=preload, daemon=True).start()
+
     def _toggle_language(self, sender):
         self.language = "en" if self.language == "sv" else "sv"
         label = "Svenska" if self.language == "sv" else "English"
@@ -574,8 +630,12 @@ def uninstall_launchagent():
 
 def main():
     parser = argparse.ArgumentParser(description="PTT — Push-to-Talk Transcription")
+    model_choices = list(MODELS.keys())
     parser.add_argument("--lang", default=DEFAULT_LANG, help="Language (sv/en)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Whisper model")
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL_KEY, choices=model_choices,
+        help=f"Model preset ({', '.join(model_choices)})",
+    )
     parser.add_argument("--key", default="alt_r", choices=KEYCODES.keys(), help="Hotkey")
     parser.add_argument("--device", type=int, default=None, help="Audio device index")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices")
@@ -594,7 +654,7 @@ def main():
         return
 
     app = PTTApp(
-        model=args.model,
+        model_key=args.model,
         language=args.lang,
         hotkey=args.key,
         device=args.device,
