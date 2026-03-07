@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -9,15 +10,30 @@
 #     "pyobjc-framework-ApplicationServices>=10.0",
 # ]
 # ///
-"""PTT — Push-to-Talk Transcription for macOS.
+"""PTT — Push-to-Talk Transcription for macOS (Apple Silicon).
 
-Menu bar app. Hold Right Option to record, release to transcribe and paste.
-Auto-calibrates mic for whispering. Runs in background without terminal.
+Menu bar app. Hold a modifier key to record speech, release to transcribe
+and paste the text where your cursor is. Runs entirely on-device using
+MLX Whisper — no API keys, no cloud, no data leaves your Mac.
+
+Features:
+  - Auto-calibrates mic sensitivity (works with whispering)
+  - Pre-roll buffer captures word onsets before key press
+  - Chunked transcription pastes text during natural pauses
+  - Built-in mic auto-detection (skips AirPlay/HomePod)
+  - Switchable models: fast general or optimized Swedish
+  - Auto-start via LaunchAgent
 
 Usage:
-  uv run ptt.py                  # Start menu bar app
-  uv run ptt.py --lang en        # English mode
-  uv run ptt.py --list-devices   # Show audio devices
+  uv run ptt.py                     # Start (Swedish, Right Option)
+  uv run ptt.py --lang en           # English mode
+  uv run ptt.py --model kb-sv       # Swedish-optimized model
+  uv run ptt.py --key alt           # Use Left Option instead
+  uv run ptt.py --list-devices      # Show audio input devices
+  uv run ptt.py --install           # Auto-start on login
+  uv run ptt.py --uninstall         # Remove auto-start
+
+Requires: macOS 13+, Apple Silicon, Accessibility permission.
 """
 
 import argparse
@@ -26,6 +42,7 @@ import ctypes
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -33,75 +50,130 @@ import time
 
 import numpy as np
 
-# --- Logging ---
-LOG_PATH = "/tmp/ptt.log"
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+LOG_DIR = os.path.expanduser("~/Library/Logs")
+LOG_PATH = os.path.join(LOG_DIR, "ptt.log")
+os.makedirs(LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
 )
 log = logging.getLogger("ptt")
 
-# --- Config ---
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
 MODELS = {
     "turbo": {
         "repo": "mlx-community/whisper-large-v3-turbo",
-        "label": "Turbo (snabb, bra)",
+        "label": "Turbo — snabb, bra på de flesta språk",
+        "size": "~1.5 GB",
     },
     "kb-sv": {
         "repo": "bratland/kb-whisper-large-mlx",
-        "label": "KB Swedish (bast svenska, langsammare)",
+        "label": "KB Swedish — bäst på svenska, långsammare",
+        "size": "~3 GB",
     },
 }
-DEFAULT_MODEL_KEY = "turbo"
-DEFAULT_LANG = "sv"
-SAMPLE_RATE = 16000
-BLOCK_DURATION = 0.1
-MIN_SPEECH_SECONDS = 0.3
-PAUSE_SECONDS = 0.8
-PRE_ROLL_SECONDS = 0.4
-CALIBRATION_SECONDS = 2.0
-THRESHOLD_MULTIPLIER = 3.0
-MIN_THRESHOLD = 0.002
 
-# macOS keycodes
+DEFAULT_MODEL = "turbo"
+DEFAULT_LANG = "sv"
+
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
+
+SAMPLE_RATE = 16000
+BLOCK_DURATION = 0.1  # seconds per audio block
+MIN_SPEECH_SECONDS = 0.3  # skip chunks shorter than this
+PAUSE_SECONDS = 0.8  # silence duration before chunk boundary
+PRE_ROLL_SECONDS = 0.4  # audio kept before key press
+CALIBRATION_SECONDS = 2.0  # ambient noise measurement
+THRESHOLD_MULTIPLIER = 3.0  # silence threshold = ambient × this
+MIN_THRESHOLD = 0.002  # absolute floor for silence detection
+
+# ---------------------------------------------------------------------------
+# Hotkeys (macOS virtual keycodes)
+# ---------------------------------------------------------------------------
+
 KEYCODES = {"alt_r": 61, "alt": 58, "ctrl_r": 62, "ctrl": 59}
-KEYCODE_FLAG = {61: 1 << 19, 58: 1 << 19, 62: 1 << 18, 59: 1 << 18}
-KEYCODE_LABELS = {
-    "alt_r": "Right Option",
-    "alt": "Left Option",
-    "ctrl_r": "Right Control",
-    "ctrl": "Left Control",
+MODIFIER_FLAGS = {61: 1 << 19, 58: 1 << 19, 62: 1 << 18, 59: 1 << 18}
+HOTKEY_LABELS = {
+    "alt_r": "Right Option (⌥)",
+    "alt": "Left Option (⌥)",
+    "ctrl_r": "Right Control (⌃)",
+    "ctrl": "Left Control (⌃)",
 }
 
+# LaunchAgent identifier
+LAUNCHAGENT_LABEL = "com.ptt.transcription"
 
-# --- Helpers ---
+# ---------------------------------------------------------------------------
+# Hallucination filter
+# ---------------------------------------------------------------------------
+
+_HALLUCINATION_ARTIFACTS = frozenset({
+    "thank you", "thanks for watching", "subscribe", "you",
+    "tack för att ni tittade", "tack för att ni tittar",
+    "undertextning", "musik", "textning", "textning.nu",
+    "untertitelung", "sous-titrage", "amara.org",
+    "text", ".", "..", "...",
+})
 
 
-def check_accessibility():
-    """Check if we have Accessibility permissions (needed for hotkey + paste)."""
+def is_hallucination(text: str) -> bool:
+    """Return True if the transcription looks like a Whisper hallucination."""
+    t = text.strip().lower()
+    if not t or len(t) <= 1:
+        return True
+    if t[0] in "([♪♫":
+        return True
+    if t in _HALLUCINATION_ARTIFACTS:
+        return True
+    # Repeated phrases: "Thank you. Thank you. Thank you."
+    words = t.split()
+    if len(words) >= 4:
+        half = len(words) // 2
+        if words[:half] == words[half : half * 2]:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# macOS helpers
+# ---------------------------------------------------------------------------
+
+
+def check_accessibility() -> bool:
+    """Check Accessibility permission (needed for global hotkey + paste)."""
     try:
         lib = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+            "/System/Library/Frameworks/ApplicationServices.framework"
+            "/ApplicationServices"
         )
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
         return lib.AXIsProcessTrusted()
     except Exception:
-        return True  # Assume yes if check fails
+        return True
 
 
 def open_accessibility_prefs():
-    subprocess.Popen(
-        [
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        ]
-    )
+    subprocess.Popen([
+        "open",
+        "x-apple.systempreferences:"
+        "com.apple.preference.security?Privacy_Accessibility",
+    ])
 
 
-def find_builtin_mic():
-    """Find the built-in MacBook mic, avoiding AirPlay/HomePod/external."""
+def find_builtin_mic() -> tuple[int | None, str]:
+    """Find the built-in microphone, skipping AirPlay / HomePod / Bluetooth."""
     import sounddevice as sd
 
     devices = sd.query_devices()
@@ -109,36 +181,17 @@ def find_builtin_mic():
         if d["max_input_channels"] <= 0:
             continue
         name = d["name"].lower()
-        if "macbook" in name or "built-in" in name or "mikrofon" in name:
+        if any(w in name for w in ("macbook", "built-in", "mikrofon", "internal")):
             return i, d["name"]
+    # Fallback to system default
     idx = sd.default.device[0]
     if idx is not None:
         return idx, sd.query_devices(idx)["name"]
     return None, "Unknown"
 
 
-def is_hallucination(text: str) -> bool:
-    t = text.strip().lower()
-    if not t or len(t) <= 1:
-        return True
-    if t.startswith(("(", "[", "♪", "♫")):
-        return True
-    words = t.split()
-    if len(words) >= 4:
-        half = len(words) // 2
-        if words[:half] == words[half : half * 2]:
-            return True
-    artifacts = {
-        "thank you", "thanks for watching", "subscribe", "you",
-        "tack för att ni tittade", "tack för att ni tittar",
-        "undertextning", "musik", "textning", "textning.nu",
-        "text", ".", "..", "...", "untertitelung", "sous-titrage",
-    }
-    return t in artifacts
-
-
 def paste_text(text: str):
-    """Copy to clipboard + simulate Cmd+V via CGEvent."""
+    """Copy text to clipboard and simulate Cmd+V via Quartz CGEvent."""
     from Quartz import (
         CGEventCreateKeyboardEvent,
         CGEventPost,
@@ -150,102 +203,108 @@ def paste_text(text: str):
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
     time.sleep(0.03)
 
-    v_key = 9  # macOS keycode for 'v'
-    down = CGEventCreateKeyboardEvent(None, v_key, True)
-    CGEventSetFlags(down, kCGEventFlagMaskCommand)
-    up = CGEventCreateKeyboardEvent(None, v_key, False)
-    CGEventSetFlags(up, kCGEventFlagMaskCommand)
-    CGEventPost(kCGHIDEventTap, down)
-    time.sleep(0.03)
-    CGEventPost(kCGHIDEventTap, up)
+    v_keycode = 9
+    for pressed in (True, False):
+        ev = CGEventCreateKeyboardEvent(None, v_keycode, pressed)
+        CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, ev)
+        if pressed:
+            time.sleep(0.03)
 
 
-# --- App ---
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 
 class PTTApp:
-    def __init__(self, model_key: str, language: str, hotkey: str, device: int | None):
+    def __init__(
+        self,
+        model_key: str,
+        language: str,
+        hotkey: str,
+        device: int | None,
+    ):
         self.model_key = model_key
-        self.model = MODELS[model_key]["repo"]
+        self.model_repo = MODELS[model_key]["repo"]
         self.language = language
         self.hotkey = hotkey
         self.hotkey_code = KEYCODES.get(hotkey, 61)
-        self.hotkey_flag = KEYCODE_FLAG.get(self.hotkey_code, 1 << 19)
+        self.hotkey_flag = MODIFIER_FLAGS.get(self.hotkey_code, 1 << 19)
         self.device_idx = device
         self.device_name = ""
+
         self.recording = False
         self.ready = False
-        self.silence_threshold = 0.005
+        self.silence_threshold = MIN_THRESHOLD
+
         self.audio_queue: queue.Queue = queue.Queue()
         self.block_size = int(SAMPLE_RATE * BLOCK_DURATION)
         self.pre_roll: collections.deque = collections.deque(
             maxlen=int(PRE_ROLL_SECONDS / BLOCK_DURATION)
         )
+
         self._rec_thread: threading.Thread | None = None
         self._stream = None
         self._app = None
-        self._lang_item = None
         self._status_item = None
+        self._model_items: dict = {}
 
-    # --- rumps menu bar ---
+    # ---- Menu bar --------------------------------------------------------
 
     def run(self):
         import rumps
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
-        # Hide from Dock — menu bar only
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
 
         self._app = rumps.App("PTT", title="◉", quit_button=None)
 
-        self._status_item = rumps.MenuItem("Laddar...")
-        self._lang_item = rumps.MenuItem(
-            f"Sprak: {'Svenska' if self.language == 'sv' else 'English'}",
+        self._status_item = rumps.MenuItem("Startar…")
+        lang_item = rumps.MenuItem(
+            f"Språk: {'Svenska' if self.language == 'sv' else 'English'}",
             callback=self._toggle_language,
         )
 
-        # Model submenu
-        self._model_menu = rumps.MenuItem("Modell")
-        self._model_items = {}
+        model_menu = rumps.MenuItem("Modell")
         for key, info in MODELS.items():
             item = rumps.MenuItem(info["label"], callback=self._switch_model)
             item._model_key = key
-            if key == self.model_key:
-                item.state = 1  # checkmark
+            item.state = 1 if key == self.model_key else 0
             self._model_items[key] = item
-            self._model_menu.add(item)
+            model_menu.add(item)
 
+        hotkey_label = HOTKEY_LABELS.get(self.hotkey, self.hotkey)
         self._app.menu = [
             self._status_item,
             None,
-            self._lang_item,
-            self._model_menu,
+            lang_item,
+            model_menu,
             rumps.MenuItem("Kalibrera mikrofon", callback=self._recalibrate_cb),
             None,
-            rumps.MenuItem("Visa logg", callback=self._open_log),
+            rumps.MenuItem(f"Tangent: {hotkey_label}"),
+            rumps.MenuItem("Visa logg…", callback=self._open_log),
+            None,
             rumps.MenuItem("Avsluta PTT", callback=self._quit),
         ]
 
-        # Check accessibility before starting
         if not check_accessibility():
-            log.warning("No Accessibility permissions!")
-            import rumps as r
-
-            r.alert(
-                title="PTT behover Accessibility",
+            log.warning("Accessibility permission missing")
+            rumps.alert(
+                title="PTT behöver Accessibility",
                 message=(
-                    "PTT behover Accessibility-behorighet for att lasa tangenter "
-                    "och klistra in text.\n\n"
-                    "Lagg till din terminal (eller PTT) i:\n"
-                    "System Settings > Privacy & Security > Accessibility"
+                    "PTT behöver Accessibility-behörighet för att läsa "
+                    "tangenter och klistra in text.\n\n"
+                    "Lägg till terminalen (eller PTT) i:\n"
+                    "Systeminställningar → Integritet och säkerhet → Hjälpmedel"
                 ),
-                ok="Oppna installningar",
+                ok="Öppna inställningar",
             )
             open_accessibility_prefs()
 
-        threading.Thread(target=self._init_background, daemon=True).start()
+        threading.Thread(target=self._init, daemon=True).start()
         self._app.run()
 
     def _set_title(self, title: str):
@@ -262,46 +321,43 @@ class PTTApp:
         except Exception:
             pass
 
-    def _notify(self, title: str, msg: str):
+    def _notify(self, title: str, message: str):
         try:
             import rumps
-            rumps.notification("PTT", title, msg, sound=False)
+            rumps.notification("PTT", title, message, sound=False)
         except Exception:
             pass
 
-    # --- Initialization ---
+    # ---- Initialization --------------------------------------------------
 
-    def _init_background(self):
+    def _init(self):
         import sounddevice as sd
         from AppKit import NSEvent
 
         try:
-            # 1. Load model
             self._set_title("⏳")
-            self._set_status("Laddar modell...")
-            log.info("Loading model: %s", self.model)
+            self._set_status("Laddar modell…")
+            log.info("Loading model: %s", self.model_repo)
 
             import mlx_whisper
-
             mlx_whisper.transcribe(
                 np.zeros(SAMPLE_RATE, dtype=np.float32),
-                path_or_hf_repo=self.model,
+                path_or_hf_repo=self.model_repo,
                 language=self.language,
             )
             log.info("Model loaded")
 
-            # 2. Find mic
+            # Mic
             if self.device_idx is not None:
                 self.device_name = sd.query_devices(self.device_idx)["name"]
             else:
                 self.device_idx, self.device_name = find_builtin_mic()
             log.info("Mic: %s (device %s)", self.device_name, self.device_idx)
-            self._set_status(f"Mic: {self.device_name}")
 
-            # 3. Calibrate
+            # Calibrate
             self._calibrate()
 
-            # 4. Audio stream
+            # Audio stream
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
@@ -312,7 +368,7 @@ class PTTApp:
             self._stream.start()
             log.info("Audio stream started")
 
-            # 5. Hotkey monitors (NSEvent)
+            # Hotkey monitors
             mask = 1 << 12  # NSEventMaskFlagsChanged
 
             def on_global(event):
@@ -320,29 +376,30 @@ class PTTApp:
 
             def on_local(event):
                 self._on_modifier(event)
-                return event  # pass event through
+                return event
 
             NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, on_global)
             NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, on_local)
-            log.info("Hotkey monitors active (keycode %d)", self.hotkey_code)
+            log.info("Hotkey active (keycode %d)", self.hotkey_code)
 
             # Ready
             self.ready = True
             self._set_title("◉")
-            hotkey_label = KEYCODE_LABELS.get(self.hotkey, "Right Option")
-            self._notify("Redo!", f"Hall {hotkey_label} och prata")
-            log.info("PTT ready!")
+            self._set_status(f"Mikrofon: {self.device_name}")
+            hotkey_label = HOTKEY_LABELS.get(self.hotkey, self.hotkey)
+            self._notify("Redo!", f"Håll {hotkey_label} och prata")
+            log.info("PTT ready")
 
         except Exception as e:
-            log.exception("Init failed: %s", e)
+            log.exception("Init failed")
             self._set_title("⚠")
             self._set_status(f"Fel: {e}")
-            self._notify("Fel vid start", str(e))
+            self._notify("Kunde inte starta", str(e))
 
     def _calibrate(self):
         import sounddevice as sd
 
-        log.info("Calibrating mic...")
+        log.info("Calibrating…")
         rec = sd.rec(
             int(SAMPLE_RATE * CALIBRATION_SECONDS),
             samplerate=SAMPLE_RATE,
@@ -350,13 +407,15 @@ class PTTApp:
             device=self.device_idx,
         )
         sd.wait()
-        ambient_rms = np.sqrt(np.mean(rec**2))
+        ambient_rms = float(np.sqrt(np.mean(rec ** 2)))
         self.silence_threshold = max(ambient_rms * THRESHOLD_MULTIPLIER, MIN_THRESHOLD)
         log.info(
-            "Ambient RMS=%.5f, threshold=%.5f", ambient_rms, self.silence_threshold
+            "Ambient RMS=%.5f → threshold=%.5f",
+            ambient_rms,
+            self.silence_threshold,
         )
 
-    # --- Hotkey handling ---
+    # ---- Hotkey ----------------------------------------------------------
 
     def _on_modifier(self, event):
         if not self.ready:
@@ -364,15 +423,13 @@ class PTTApp:
         if event.keyCode() != self.hotkey_code:
             return
 
-        flags = event.modifierFlags()
-        pressed = bool(flags & self.hotkey_flag)
-
+        pressed = bool(event.modifierFlags() & self.hotkey_flag)
         if pressed and not self.recording:
             self._start_rec()
         elif not pressed and self.recording:
             self._stop_rec()
 
-    # --- Recording ---
+    # ---- Recording -------------------------------------------------------
 
     def _audio_cb(self, indata, frames, time_info, status):
         block = indata.copy()
@@ -393,7 +450,7 @@ class PTTApp:
             except queue.Empty:
                 break
 
-        # Pre-roll: capture word onsets before key press
+        # Pre-roll: capture word onsets before key was pressed
         for block in self.pre_roll:
             self.audio_queue.put(block)
         self.pre_roll.clear()
@@ -419,7 +476,7 @@ class PTTApp:
             except queue.Empty:
                 continue
 
-            rms = np.sqrt(np.mean(block**2))
+            rms = float(np.sqrt(np.mean(block ** 2)))
 
             if rms > self.silence_threshold:
                 speech_buf.append(block)
@@ -434,9 +491,10 @@ class PTTApp:
                     silent_blocks = 0
                     has_speech = False
 
-        # Final chunk on release
         if speech_buf and has_speech:
             self._transcribe(speech_buf)
+
+    # ---- Transcription ---------------------------------------------------
 
     def _transcribe(self, blocks):
         import mlx_whisper
@@ -444,7 +502,7 @@ class PTTApp:
         audio = np.concatenate(blocks).flatten().astype(np.float32)
         duration = len(audio) / SAMPLE_RATE
         if duration < MIN_SPEECH_SECONDS:
-            log.info("Skipped: too short (%.2fs)", duration)
+            log.info("Skipped chunk (%.2fs < min)", duration)
             return
 
         self._set_title("⏳")
@@ -453,11 +511,11 @@ class PTTApp:
         try:
             result = mlx_whisper.transcribe(
                 audio,
-                path_or_hf_repo=self.model,
+                path_or_hf_repo=self.model_repo,
                 language=self.language,
             )
-        except Exception as e:
-            log.error("Transcription error: %s", e)
+        except Exception:
+            log.exception("Transcription error")
             self._set_title("●" if self.recording else "◉")
             return
 
@@ -468,45 +526,48 @@ class PTTApp:
             try:
                 paste_text(text + " ")
                 speed = duration / elapsed if elapsed > 0 else 0
-                log.info("'%s' (%.1fs audio, %.1fs proc, %.0fx)", text, duration, elapsed, speed)
-            except Exception as e:
-                log.error("Paste failed: %s (text in clipboard)", e)
+                log.info(
+                    "'%s'  (%.1fs audio → %.1fs, %.0f×)",
+                    text, duration, elapsed, speed,
+                )
+            except Exception:
+                log.exception("Paste failed — text is in clipboard")
         else:
-            log.info("Filtered hallucination: '%s'", text)
+            log.info("Filtered: '%s'", text)
 
         self._set_title("●" if self.recording else "◉")
 
-    # --- Menu callbacks ---
+    # ---- Menu callbacks --------------------------------------------------
 
     def _switch_model(self, sender):
         key = sender._model_key
         if key == self.model_key:
             return
+
         self.model_key = key
-        self.model = MODELS[key]["repo"]
-        # Update checkmarks
+        self.model_repo = MODELS[key]["repo"]
         for k, item in self._model_items.items():
             item.state = 1 if k == key else 0
-        log.info("Switching model to: %s (%s)", key, self.model)
-        self._notify("Modell", MODELS[key]["label"])
 
-        # Pre-load model in background
+        log.info("Model → %s (%s)", key, self.model_repo)
+        self._notify("Byter modell…", MODELS[key]["label"])
+
         def preload():
             self._set_title("⏳")
-            self._set_status("Laddar modell...")
+            self._set_status("Laddar modell…")
             try:
                 import mlx_whisper
                 mlx_whisper.transcribe(
                     np.zeros(SAMPLE_RATE, dtype=np.float32),
-                    path_or_hf_repo=self.model,
+                    path_or_hf_repo=self.model_repo,
                     language=self.language,
                 )
                 log.info("Model %s loaded", key)
-                self._set_status(f"Mic: {self.device_name}")
+                self._set_status(f"Mikrofon: {self.device_name}")
                 self._notify("Modell laddad", MODELS[key]["label"])
             except Exception as e:
-                log.error("Model load failed: %s", e)
-                self._notify("Fel", str(e))
+                log.exception("Model switch failed")
+                self._notify("Fel vid modellbyte", str(e))
             self._set_title("◉")
 
         threading.Thread(target=preload, daemon=True).start()
@@ -514,22 +575,22 @@ class PTTApp:
     def _toggle_language(self, sender):
         self.language = "en" if self.language == "sv" else "sv"
         label = "Svenska" if self.language == "sv" else "English"
-        sender.title = f"Sprak: {label}"
-        self._notify("Sprak", label)
-        log.info("Language: %s", self.language)
+        sender.title = f"Språk: {label}"
+        self._notify("Språk", label)
+        log.info("Language → %s", self.language)
 
-    def _recalibrate_cb(self, sender=None):
+    def _recalibrate_cb(self, _sender=None):
         def do():
-            self._notify("Kalibrerar...", "Var tyst i 2 sekunder")
+            self._notify("Kalibrerar…", "Var tyst i 2 sekunder")
             self._calibrate()
-            self._notify("Klart!", f"Troskel: {self.silence_threshold:.4f}")
+            self._notify("Klart!", f"Tröskel: {self.silence_threshold:.4f}")
 
         threading.Thread(target=do, daemon=True).start()
 
-    def _open_log(self, sender=None):
+    def _open_log(self, _sender=None):
         subprocess.Popen(["open", "-a", "Console", LOG_PATH])
 
-    def _quit(self, sender=None):
+    def _quit(self, _sender=None):
         import rumps
 
         self.recording = False
@@ -541,7 +602,9 @@ class PTTApp:
         rumps.quit_application()
 
 
-# --- CLI ---
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def list_devices():
@@ -552,30 +615,45 @@ def list_devices():
     print("\n  Audio input devices:\n")
     for i, d in enumerate(devices):
         if d["max_input_channels"] > 0:
-            markers = []
+            tags = []
             if i == sd.default.device[0]:
-                markers.append("default")
+                tags.append("default")
             if i == builtin_idx:
-                markers.append("built-in")
-            suffix = f"  ({', '.join(markers)})" if markers else ""
+                tags.append("built-in")
+            suffix = f"  ({', '.join(tags)})" if tags else ""
             print(f"    {i}: {d['name']}{suffix}")
     print()
 
 
+def _find_uv() -> str:
+    """Locate the uv binary."""
+    uv = shutil.which("uv")
+    if uv:
+        return uv
+    candidate = os.path.expanduser("~/.local/bin/uv")
+    if os.path.isfile(candidate):
+        return candidate
+    candidate = os.path.expanduser("~/.cargo/bin/uv")
+    if os.path.isfile(candidate):
+        return candidate
+    return "uv"
+
+
 def install_launchagent():
-    """Install LaunchAgent for auto-start on login."""
-    plist_name = "com.leon.ptt.plist"
+    """Install a LaunchAgent so PTT starts automatically on login."""
     plist_dir = os.path.expanduser("~/Library/LaunchAgents")
-    plist_path = os.path.join(plist_dir, plist_name)
-    uv_path = os.path.expanduser("~/.local/bin/uv")
+    plist_path = os.path.join(plist_dir, f"{LAUNCHAGENT_LABEL}.plist")
+    uv_path = _find_uv()
     script_path = os.path.abspath(__file__)
 
-    content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    plist = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.leon.ptt</string>
+    <string>{LAUNCHAGENT_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{uv_path}</string>
@@ -590,9 +668,9 @@ def install_launchagent():
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>/tmp/ptt-stdout.log</string>
+    <string>{LOG_PATH}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/ptt-stderr.log</string>
+    <string>{LOG_PATH}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -604,22 +682,22 @@ def install_launchagent():
 </plist>"""
 
     os.makedirs(plist_dir, exist_ok=True)
-
-    # Unload existing if present
     if os.path.exists(plist_path):
         subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
 
     with open(plist_path, "w") as f:
-        f.write(content)
+        f.write(plist)
 
     subprocess.run(["launchctl", "load", plist_path], check=True)
     print(f"  Installed: {plist_path}")
-    print("  PTT will auto-start on login.")
-    print("  To remove: ptt --uninstall")
+    print("  PTT will start automatically on login.")
+    print("  Remove with: ptt --uninstall")
 
 
 def uninstall_launchagent():
-    plist_path = os.path.expanduser("~/Library/LaunchAgents/com.leon.ptt.plist")
+    plist_path = os.path.expanduser(
+        f"~/Library/LaunchAgents/{LAUNCHAGENT_LABEL}.plist"
+    )
     if os.path.exists(plist_path):
         subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
         os.remove(plist_path)
@@ -629,18 +707,38 @@ def uninstall_launchagent():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PTT — Push-to-Talk Transcription")
-    model_choices = list(MODELS.keys())
-    parser.add_argument("--lang", default=DEFAULT_LANG, help="Language (sv/en)")
-    parser.add_argument(
-        "--model", default=DEFAULT_MODEL_KEY, choices=model_choices,
-        help=f"Model preset ({', '.join(model_choices)})",
+    parser = argparse.ArgumentParser(
+        prog="ptt",
+        description="PTT — Push-to-Talk Transcription for macOS",
     )
-    parser.add_argument("--key", default="alt_r", choices=KEYCODES.keys(), help="Hotkey")
-    parser.add_argument("--device", type=int, default=None, help="Audio device index")
-    parser.add_argument("--list-devices", action="store_true", help="List audio devices")
-    parser.add_argument("--install", action="store_true", help="Install auto-start")
-    parser.add_argument("--uninstall", action="store_true", help="Remove auto-start")
+    parser.add_argument(
+        "--lang", default=DEFAULT_LANG, metavar="CODE",
+        help="Language code, e.g. sv, en, de (default: sv)",
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL, choices=list(MODELS),
+        help="Whisper model preset (default: turbo)",
+    )
+    parser.add_argument(
+        "--key", default="alt_r", choices=list(KEYCODES),
+        help="Hotkey modifier (default: alt_r = Right Option)",
+    )
+    parser.add_argument(
+        "--device", type=int, default=None, metavar="N",
+        help="Audio input device index (default: auto-detect built-in mic)",
+    )
+    parser.add_argument(
+        "--list-devices", action="store_true",
+        help="List audio input devices and exit",
+    )
+    parser.add_argument(
+        "--install", action="store_true",
+        help="Install LaunchAgent for auto-start on login",
+    )
+    parser.add_argument(
+        "--uninstall", action="store_true",
+        help="Remove LaunchAgent",
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -653,13 +751,12 @@ def main():
         uninstall_launchagent()
         return
 
-    app = PTTApp(
+    PTTApp(
         model_key=args.model,
         language=args.lang,
         hotkey=args.key,
         device=args.device,
-    )
-    app.run()
+    ).run()
 
 
 if __name__ == "__main__":
