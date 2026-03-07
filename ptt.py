@@ -54,6 +54,16 @@ PLIST_PATH = os.path.expanduser(
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
+# Truncate log if older than 1 hour or larger than 256 KB
+try:
+    if os.path.isfile(LOG_PATH):
+        age = time.time() - os.path.getmtime(LOG_PATH)
+        size = os.path.getsize(LOG_PATH)
+        if age > 3600 or size > 256_000:
+            open(LOG_PATH, "w").close()
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s  %(message)s",
