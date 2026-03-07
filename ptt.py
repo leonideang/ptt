@@ -769,11 +769,11 @@ class PTTApp:
             try:
                 paste_text(text + " ")
                 speed = duration / elapsed if elapsed > 0 else 0
-                log.info("'%s'  (%.1fs → %.1fs, %.0f×)", text, duration, elapsed, speed)
+                log.info("Pasted %d chars  (%.1fs → %.1fs, %.0f×)", len(text), duration, elapsed, speed)
             except Exception:
                 log.exception("Paste failed — text in clipboard")
         else:
-            log.info("Filtered: '%s'", text)
+            log.info("Filtered hallucination")
 
         if self.recording:
             self._show_icon(self._icon_rec[0])
