@@ -726,6 +726,10 @@ def _get_delegate_class():
             if _ptt_ref:
                 _ptt_ref._on_edit_polish_prompt()
 
+        def savePolishPrompt_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_save_polish_prompt()
+
         def clearLog_(self, sender):
             if _ptt_ref:
                 _ptt_ref._on_clear_log()
@@ -785,6 +789,7 @@ class PTTApp:
         self._win_hotkey_keys: list = []
         self._groq_key_field = None
         self._groq_status_label = None
+        self._polish_prompt_tv = None
 
     # ---- Persistence -----------------------------------------------------
 
@@ -835,7 +840,6 @@ class PTTApp:
 
         self._app.menu = [
             rumps.MenuItem(_t("Inställningar…", "Settings…"), callback=self._on_open_settings),
-            rumps.MenuItem(_t("Visa logg…", "Show log…"), callback=self._on_open_log),
             None,
             rumps.MenuItem(_t("Avsluta", "Quit"), callback=self._on_quit),
         ]
@@ -1254,7 +1258,7 @@ class PTTApp:
         delegate = DelegateCls.alloc().init()
         self._settings_delegate = delegate  # prevent GC
 
-        W, H = 420, 680
+        W, H = 420, 760
         style = 1 | 2  # NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -1319,13 +1323,13 @@ class PTTApp:
 
         # ── TRANSCRIPTION ──────────────────────────────────────
         add_label(_t("Transkribering", "Transcription"), LX, y, bold=True, size=13)
-        y -= 8
+        y -= 20
         add_label(
             _t("Håll tangenten, prata, släpp — texten klistras in",
                "Hold hotkey, speak, release — text is pasted"),
             LX, y, size=11, color=sec,
         )
-        y -= 30
+        y -= 28
 
         # Language
         add_label(_t("Språk", "Language"), LX, y)
@@ -1377,7 +1381,12 @@ class PTTApp:
 
         # Microphone
         add_label(_t("Mikrofon", "Microphone"), LX, y)
-        mic_text = self.device_name if self.device_name else _t("Ej identifierad", "Not detected")
+        if self.device_name:
+            mic_text = self.device_name
+        elif not self.ready:
+            mic_text = _t("Laddar…", "Loading…")
+        else:
+            mic_text = _t("Ej identifierad", "Not detected")
         add_label(mic_text, PX, y, w=120, size=11, color=sec)
         add_btn(_t("Kalibrera", "Calibrate"), y, "calibrateClicked:")
         y -= 32
@@ -1400,13 +1409,13 @@ class PTTApp:
 
         # ── TEXT POLISH ────────────────────────────────────────
         add_label(_t("Textpolering", "Text polish"), LX, y, bold=True, size=13)
-        y -= 8
+        y -= 20
         add_label(
-            _t(f"Håll ⌘ + tangent för att rensa talspråk",
-               f"Hold ⌘ + hotkey to clean up spoken text"),
+            _t("Håll ⌘ + tangent för att rensa talspråk",
+               "Hold ⌘ + hotkey to clean up spoken text"),
             LX, y, size=11, color=sec,
         )
-        y -= 18
+        y -= 16
         add_label(
             _t("Texten skickas till Groq (groq.com) för bearbetning",
                "Text is sent to Groq (groq.com) for processing"),
@@ -1430,18 +1439,33 @@ class PTTApp:
             content.addSubview_(key_field)
             self._groq_key_field = key_field
             add_btn(_t("Spara", "Save"), y, "saveGroqKey:")
-        y -= 32
+        y -= 30
 
-        # Polish prompt
-        add_label(
-            _t("Prompt", "Prompt"),
-            LX, y,
-        )
+        # Polish prompt — collapsible inline editor
+        add_label(_t("Prompt", "Prompt"), LX, y)
         add_label(
             _t("Instruktioner till AI:n", "Instructions for the AI"),
             PX, y, w=140, size=11, color=sec,
         )
-        add_btn(_t("Redigera…", "Edit…"), y, "editPolishPrompt:")
+        y -= 24
+
+        from AppKit import NSTextView, NSScrollView
+        prompt_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(LX, y - 70, W - 40, 74))
+        prompt_scroll.setHasVerticalScroller_(True)
+        prompt_scroll.setBorderType_(3)  # NSBezelBorder
+        prompt_tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 58, 70))
+        prompt_tv.setFont_(NSFont.systemFontOfSize_(11))
+        prompt_tv.setEditable_(True)
+        prompt_tv.setRichText_(False)
+        # Load current prompt
+        current_prompt = _read_commented_file(POLISH_PROMPT_PATH, sep=" ") or ""
+        prompt_tv.setString_(current_prompt)
+        prompt_scroll.setDocumentView_(prompt_tv)
+        content.addSubview_(prompt_scroll)
+        self._polish_prompt_tv = prompt_tv
+        y -= 80
+
+        add_btn(_t("Spara prompt", "Save prompt"), y, "savePolishPrompt:", x=LX, w=120)
 
         y -= 20
         add_separator(y)
@@ -1467,8 +1491,8 @@ class PTTApp:
         log_chk.setTarget_(delegate)
         log_chk.setAction_("loggingChanged:")
         content.addSubview_(log_chk)
-        add_btn(_t("Rensa", "Clear"), y, "clearLog:", x=BX - 50, w=60)
-        add_btn(_t("Visa", "View"), y, "openLog:", x=BX + 20, w=60)
+        add_btn(_t("Rensa", "Clear"), y, "clearLog:", x=BX - 60, w=70)
+        add_btn(_t("Visa", "View"), y, "openLog:", x=BX + 20, w=70)
 
         y -= 34
 
@@ -1492,6 +1516,17 @@ class PTTApp:
     def _on_edit_polish_prompt(self, _sender=None):
         _ensure_polish_prompt_file()
         subprocess.Popen(["open", "-t", POLISH_PROMPT_PATH])
+
+    def _on_save_polish_prompt(self, _sender=None):
+        if not self._polish_prompt_tv:
+            return
+        text = str(self._polish_prompt_tv.string()).strip()
+        with open(POLISH_PROMPT_PATH, "w") as f:
+            f.write(text + "\n")
+        self._notify(
+            _t("Prompt sparad", "Prompt saved"),
+            _t("Poleringsprompt uppdaterad", "Polish prompt updated"),
+        )
 
     def _on_clear_log(self, _sender=None):
         try:
