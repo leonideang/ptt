@@ -88,11 +88,11 @@ for _name in ("httpx", "huggingface_hub", "tqdm"):
 MODELS = {
     "turbo": {
         "repo": "mlx-community/whisper-large-v3-turbo",
-        "label": "Turbo -- snabb, alla sprak",
+        "label": "Turbo — snabb, alla språk",
     },
     "kb-sv": {
         "repo": "bratland/kb-whisper-large-mlx",
-        "label": "KB Swedish -- bast pa svenska",
+        "label": "KB Swedish — bäst på svenska",
     },
 }
 
@@ -115,10 +115,10 @@ ANIM_INTERVAL = 3
 # ---------------------------------------------------------------------------
 
 HOTKEYS = {
-    "alt_r":  {"code": 61, "flag": 1 << 19, "label": "Hoger Option"},
-    "alt":    {"code": 58, "flag": 1 << 19, "label": "Vanster Option"},
-    "ctrl_r": {"code": 62, "flag": 1 << 18, "label": "Hoger Control"},
-    "ctrl":   {"code": 59, "flag": 1 << 18, "label": "Vanster Control"},
+    "alt_r":  {"code": 61, "flag": 1 << 19, "label": "Höger Option (⌥)"},
+    "alt":    {"code": 58, "flag": 1 << 19, "label": "Vänster Option (⌥)"},
+    "ctrl_r": {"code": 62, "flag": 1 << 18, "label": "Höger Control (⌃)"},
+    "ctrl":   {"code": 59, "flag": 1 << 18, "label": "Vänster Control (⌃)"},
 }
 
 # ---------------------------------------------------------------------------
@@ -212,11 +212,11 @@ def ensure_prompt_file():
     if not os.path.isfile(PROMPT_PATH):
         with open(PROMPT_PATH, "w") as f:
             f.write(
-                "# PTT -- Ordlista\n"
+                "# PTT — Ordlista\n"
                 "#\n"
-                "# Skriv ord och namn som ofta hors fel.\n"
+                "# Skriv ord och namn som ofta hörs fel.\n"
                 "# En post per rad, eller kommaseparerat.\n"
-                "# Rader som borjar med # ignoreras.\n"
+                "# Rader som börjar med # ignoreras.\n"
                 "#\n"
                 "# Exempel:\n"
                 "# Claude Code, Kajabi\n"
@@ -229,7 +229,7 @@ def ensure_prompt_file():
 
 _ARTIFACTS = frozenset({
     "thank you", "thanks for watching", "subscribe", "you",
-    "tack for att ni tittade", "tack for att ni tittar",
+    "tack för att ni tittade", "tack för att ni tittar",
     "undertextning", "musik", "textning", "textning.nu",
     "untertitelung", "sous-titrage", "amara.org",
     "text", ".", "..", "...",
@@ -240,7 +240,7 @@ def is_hallucination(text: str) -> bool:
     t = text.strip().lower()
     if not t or len(t) <= 1:
         return True
-    if t[0] in "([":
+    if t[0] in "([♪♫":
         return True
     if t in _ARTIFACTS:
         return True
@@ -582,13 +582,13 @@ class PTTApp:
 
         self._app = rumps.App("PTT", title="PTT", quit_button=None)
 
-        self._status_item = rumps.MenuItem("Startar...")
+        self._status_item = rumps.MenuItem("Startar…")
 
         self._app.menu = [
             self._status_item,
             None,
-            rumps.MenuItem("Installningar...", callback=self._on_open_settings),
-            rumps.MenuItem("Visa logg...", callback=self._on_open_log),
+            rumps.MenuItem("Inställningar…", callback=self._on_open_settings),
+            rumps.MenuItem("Visa logg…", callback=self._on_open_log),
             None,
             rumps.MenuItem("Avsluta", callback=self._on_quit),
         ]
@@ -597,14 +597,14 @@ class PTTApp:
         if not check_accessibility():
             log.warning("Accessibility permission missing")
             rumps.alert(
-                title="PTT behover Accessibility",
+                title="PTT behöver Accessibility",
                 message=(
-                    "PTT behover behorighet for att lasa tangenter "
+                    "PTT behöver behörighet för att läsa tangenter "
                     "och klistra in text.\n\n"
-                    "Lagg till appen i:\n"
-                    "Installningar > Integritet och sakerhet > Hjalpmedel"
+                    "Lägg till appen i:\n"
+                    "Inställningar → Integritet och säkerhet → Hjälpmedel"
                 ),
-                ok="Oppna installningar",
+                ok="Öppna inställningar",
             )
             subprocess.Popen([
                 "open",
@@ -653,7 +653,7 @@ class PTTApp:
 
         try:
             self._show_icon(self._icon_busy)
-            self._set_status("Laddar modell...")
+            self._set_status("Laddar modell…")
             log.info("Loading model: %s", self.model_repo)
 
             import mlx_whisper
@@ -707,14 +707,14 @@ class PTTApp:
             if not self.settings.get("intro_shown"):
                 self._notify(
                     "Redo!",
-                    f"Hall {label} och prata.\n"
-                    "Slapp for att transkribera och klistra in.\n"
-                    "Klicka ikonen for installningar.",
+                    f"Håll {label} och prata.\n"
+                    "Släpp för att transkribera och klistra in.\n"
+                    "Klicka ikonen för inställningar.",
                 )
                 self.settings["intro_shown"] = True
                 save_settings(self.settings)
             else:
-                self._notify("Redo!", f"Hall {label} och prata")
+                self._notify("Redo!", f"Håll {label} och prata")
 
         except Exception as e:
             log.exception("Init failed")
@@ -724,7 +724,7 @@ class PTTApp:
     def _calibrate(self):
         import sounddevice as sd
 
-        log.info("Calibrating...")
+        log.info("Calibrating…")
         rec = sd.rec(
             int(SAMPLE_RATE * CALIBRATION_SECONDS),
             samplerate=SAMPLE_RATE, channels=1, device=self.device_idx,
@@ -876,11 +876,11 @@ class PTTApp:
         self.model_repo = MODELS[key]["repo"]
         self._save()
         log.info("Model -> %s", key)
-        self._notify("Byter modell...", MODELS[key]["label"])
+        self._notify("Byter modell…", MODELS[key]["label"])
 
         def preload():
             self._show_icon(self._icon_busy)
-            self._set_status("Laddar modell...")
+            self._set_status("Laddar modell…")
             try:
                 import mlx_whisper
                 mlx_whisper.transcribe(
@@ -906,13 +906,13 @@ class PTTApp:
         self.hotkey_flag = hk["flag"]
         self._save()
         log.info("Hotkey -> %s", key)
-        self._notify("Tangent andrad", hk["label"])
+        self._notify("Tangent ändrad", hk["label"])
 
     def _set_autostart(self, enabled: bool):
         self.settings["autostart"] = enabled
         save_settings(self.settings)
         set_autostart(enabled)
-        msg = "Startar automatiskt vid inloggning" if enabled else "Autostart avstangd"
+        msg = "Startar automatiskt vid inloggning" if enabled else "Autostart avstängd"
         self._notify("Autostart", msg)
 
     # ---- Settings window -------------------------------------------------
@@ -941,7 +941,7 @@ class PTTApp:
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False
         )
-        win.setTitle_("PTT -- Installningar")
+        win.setTitle_("PTT — Inställningar")
         win.center()
 
         content = win.contentView()
@@ -978,7 +978,7 @@ class PTTApp:
             return popup
 
         # --- Language ---
-        add_label("Sprak", LX, y)
+        add_label("Språk", LX, y)
         self._win_lang_codes = []
         lang_labels = []
         available_langs = [("en", "English")]
@@ -1046,7 +1046,7 @@ class PTTApp:
         add_label("Ord som Whisper ofta missar", LX, y, w=220)
 
         edit_btn = NSButton.alloc().initWithFrame_(NSMakeRect(280, y - 4, 95, 28))
-        edit_btn.setTitle_("Redigera...")
+        edit_btn.setTitle_("Redigera…")
         edit_btn.setBezelStyle_(1)
         edit_btn.setTarget_(delegate)
         edit_btn.setAction_("editPromptClicked:")
@@ -1067,7 +1067,7 @@ class PTTApp:
 
         # --- Footer ---
         add_label(
-            "PTT -- lokal transkribering med MLX Whisper",
+            "PTT — lokal transkribering med MLX Whisper",
             LX, y, w=360, size=10,
         )
 
@@ -1082,9 +1082,9 @@ class PTTApp:
 
     def _on_recalibrate(self, _sender=None):
         def do():
-            self._notify("Kalibrerar...", "Var tyst i 2 sekunder")
+            self._notify("Kalibrerar…", "Var tyst i 2 sekunder")
             self._calibrate()
-            self._notify("Klart!", f"Troskel: {self.silence_threshold:.4f}")
+            self._notify("Klart!", f"Tröskel: {self.silence_threshold:.4f}")
         threading.Thread(target=do, daemon=True).start()
 
     def _on_open_log(self, _sender=None):
