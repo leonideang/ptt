@@ -182,6 +182,9 @@ _DEFAULT_SETTINGS = {
     "autostart": False,
     "intro_shown": False,
     "logging": True,
+    "sounds": False,
+    "restore_clipboard": True,
+    "history": True,
 }
 
 
@@ -350,11 +353,19 @@ def find_builtin_mic() -> tuple[int | None, str]:
     return None, "Unknown"
 
 
-def paste_text(text: str):
+def paste_text(text: str, restore_clipboard: bool = True):
+    from AppKit import NSPasteboard, NSPasteboardTypeString
     from Quartz import (
         CGEventCreateKeyboardEvent, CGEventPost,
         CGEventSetFlags, kCGEventFlagMaskCommand, kCGHIDEventTap,
     )
+
+    pb = NSPasteboard.generalPasteboard()
+
+    # Save current clipboard
+    old_contents = None
+    if restore_clipboard:
+        old_contents = pb.stringForType_(NSPasteboardTypeString)
 
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
     time.sleep(0.03)
@@ -364,6 +375,14 @@ def paste_text(text: str):
         CGEventPost(kCGHIDEventTap, ev)
         if pressed:
             time.sleep(0.03)
+
+    # Restore clipboard after paste lands
+    if restore_clipboard and old_contents is not None:
+        def _restore():
+            time.sleep(0.2)
+            pb.clearContents()
+            pb.setString_forType_(old_contents, NSPasteboardTypeString)
+        threading.Thread(target=_restore, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +757,18 @@ def _get_delegate_class():
             if _ptt_ref:
                 _ptt_ref._on_open_log()
 
+        def clipboardChanged_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._set_setting("restore_clipboard", sender.state() == 1)
+
+        def soundsChanged_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._set_setting("sounds", sender.state() == 1)
+
+        def historyChanged_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._set_setting("history", sender.state() == 1)
+
     _SettingsDelegate = _SD
     return _SettingsDelegate
 
@@ -790,6 +821,7 @@ class PTTApp:
         self._groq_key_field = None
         self._groq_status_label = None
         self._polish_prompt_tv = None
+        self._history: collections.deque = collections.deque(maxlen=10)
 
     # ---- Persistence -----------------------------------------------------
 
@@ -808,6 +840,56 @@ class PTTApp:
         self._icon_idle = make_waveform(WAVE_IDLE)
         self._icon_rec = [make_waveform(f) for f in WAVE_REC]
         self._icon_busy = make_waveform(WAVE_BUSY)
+
+    def _paste(self, text: str):
+        """Paste text, respecting clipboard restore setting."""
+        restore = self.settings.get("restore_clipboard", True)
+        paste_text(text, restore_clipboard=restore)
+        self._add_history(text.strip())
+
+    def _play_sound(self, name: str):
+        """Play a system sound if sounds are enabled."""
+        if not self.settings.get("sounds", False):
+            return
+        try:
+            from AppKit import NSSound
+            sound = NSSound.soundNamed_(name)
+            if sound:
+                sound.play()
+        except Exception:
+            pass
+
+    def _add_history(self, text: str):
+        if not text or not self.settings.get("history", True):
+            return
+        self._history.appendleft(text)
+        self._update_history_menu()
+
+    def _update_history_menu(self):
+        import rumps
+        try:
+            menu = self._app.menu
+            # Remove old history submenu if present
+            hist_key = _t("Senaste", "Recent")
+            if hist_key in menu:
+                del menu[hist_key]
+            if not self._history:
+                return
+            sub = rumps.MenuItem(hist_key)
+            for text in self._history:
+                display = (text[:55] + "…") if len(text) > 55 else text
+                item = rumps.MenuItem(display, callback=self._make_copy_cb(text))
+                sub[display] = item
+            # Insert after first item (Settings)
+            menu.insert_after(_t("Inställningar…", "Settings…"), sub)
+        except Exception:
+            log.debug("History menu update failed", exc_info=True)
+
+    def _make_copy_cb(self, text: str):
+        def cb(_):
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+            self._notify(_t("Kopierat", "Copied"), (text[:60] + "…") if len(text) > 60 else text)
+        return cb
 
     def _show_icon(self, nsimage):
         try:
@@ -1037,6 +1119,7 @@ class PTTApp:
 
         self.recording = True
         self._show_icon(self._icon_rec[0])
+        self._play_sound("Tink")
         log.info("REC start")
 
         while not self.audio_queue.empty():
@@ -1053,6 +1136,7 @@ class PTTApp:
 
     def _stop_rec(self):
         self.recording = False
+        self._play_sound("Pop")
         log.info("REC stop")
 
     def _rec_loop(self):
@@ -1110,14 +1194,14 @@ class PTTApp:
             polished = polish_text(raw, self.language)
             if polished:
                 try:
-                    paste_text(polished + " ")
+                    self._paste(polished + " ")
                     log.info("Polished and pasted %d chars (was %d)", len(polished), len(raw))
                 except Exception:
                     log.exception("Paste failed after polish")
             else:
                 log.warning("Polish failed, pasting raw text")
                 try:
-                    paste_text(raw + " ")
+                    self._paste(raw + " ")
                 except Exception:
                     log.exception("Paste failed")
 
@@ -1164,7 +1248,7 @@ class PTTApp:
                     self._show_icon(self._icon_rec[0])
                 return text
             try:
-                paste_text(text + " ")
+                self._paste(text + " ")
                 log.info("Pasted %d chars  (%.1fs -> %.1fs, %.0fx)", len(text), duration, elapsed, speed)
             except Exception:
                 log.exception("Paste failed -- text in clipboard")
@@ -1223,6 +1307,10 @@ class PTTApp:
         log.info("Hotkey -> %s", key)
         self._notify(_t("Tangent ändrad", "Hotkey changed"), hotkey_label(key))
 
+    def _set_setting(self, key: str, value):
+        self.settings[key] = value
+        save_settings(self.settings)
+
     def _set_logging(self, enabled: bool):
         self.settings["logging"] = enabled
         save_settings(self.settings)
@@ -1258,7 +1346,7 @@ class PTTApp:
         delegate = DelegateCls.alloc().init()
         self._settings_delegate = delegate  # prevent GC
 
-        W, H = 420, 760
+        W, H = 420, 840
         style = 1 | 2  # NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -1493,8 +1581,35 @@ class PTTApp:
         content.addSubview_(log_chk)
         add_btn(_t("Rensa", "Clear"), y, "clearLog:", x=BX - 60, w=70)
         add_btn(_t("Visa", "View"), y, "openLog:", x=BX + 20, w=70)
+        y -= 26
 
-        y -= 34
+        clip_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 350, 22))
+        clip_chk.setButtonType_(3)
+        clip_chk.setTitle_(_t("Återställ urklipp efter inklistring", "Restore clipboard after paste"))
+        clip_chk.setState_(1 if self.settings.get("restore_clipboard", True) else 0)
+        clip_chk.setTarget_(delegate)
+        clip_chk.setAction_("clipboardChanged:")
+        content.addSubview_(clip_chk)
+        y -= 26
+
+        sound_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 350, 22))
+        sound_chk.setButtonType_(3)
+        sound_chk.setTitle_(_t("Ljudfeedback vid inspelning", "Sound feedback when recording"))
+        sound_chk.setState_(1 if self.settings.get("sounds", False) else 0)
+        sound_chk.setTarget_(delegate)
+        sound_chk.setAction_("soundsChanged:")
+        content.addSubview_(sound_chk)
+        y -= 26
+
+        hist_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 350, 22))
+        hist_chk.setButtonType_(3)
+        hist_chk.setTitle_(_t("Visa senaste transkriptioner i menyn", "Show recent transcriptions in menu"))
+        hist_chk.setState_(1 if self.settings.get("history", True) else 0)
+        hist_chk.setTarget_(delegate)
+        hist_chk.setAction_("historyChanged:")
+        content.addSubview_(hist_chk)
+
+        y -= 30
 
         # --- Footer ---
         add_label(
