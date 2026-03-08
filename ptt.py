@@ -88,13 +88,22 @@ for _name in ("httpx", "huggingface_hub", "tqdm"):
 MODELS = {
     "turbo": {
         "repo": "mlx-community/whisper-large-v3-turbo",
-        "label": "Turbo — snabb, alla språk",
+        "label_sv": "Turbo — snabb, alla språk",
+        "label_en": "Turbo — fast, all languages",
+        "swedish_only": False,
     },
     "kb-sv": {
         "repo": "bratland/kb-whisper-large-mlx",
-        "label": "KB Swedish — bäst på svenska",
+        "label_sv": "KB Swedish — bäst på svenska",
+        "label_en": "KB Swedish — best for Swedish",
+        "swedish_only": True,
     },
 }
+
+
+def model_label(key: str) -> str:
+    info = MODELS[key]
+    return info["label_sv"] if system_has_swedish() else info["label_en"]
 
 # ---------------------------------------------------------------------------
 # Audio constants
@@ -617,10 +626,15 @@ class PTTApp:
 
     def _set_status(self, text: str):
         try:
-            if self._status_item:
-                self._status_item.title = text
-        except Exception:
-            pass
+            if not self._status_item:
+                return
+            # NSMenuItem.setTitle_ must be called on the main thread
+            mi = self._status_item._menuitem
+            mi.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "setTitle:", text, False
+            )
+        except Exception as e:
+            log.debug("_set_status failed: %s", e)
 
     def _notify(self, title: str, message: str):
         try:
@@ -876,7 +890,7 @@ class PTTApp:
         self.model_repo = MODELS[key]["repo"]
         self._save()
         log.info("Model -> %s", key)
-        self._notify("Byter modell…", MODELS[key]["label"])
+        self._notify("Byter modell…", model_label(key))
 
         def preload():
             self._show_icon(self._icon_busy)
@@ -889,7 +903,7 @@ class PTTApp:
                     language=self.language,
                 )
                 self._set_status(f"Redo | {self.device_name}")
-                self._notify("Modell laddad", MODELS[key]["label"])
+                self._notify("Modell laddad", model_label(key))
             except Exception as e:
                 log.exception("Model switch failed")
                 self._notify("Fel vid modellbyte", str(e))
@@ -999,9 +1013,12 @@ class PTTApp:
         add_label("Modell", LX, y)
         self._win_model_keys = []
         model_labels = []
+        has_sv = system_has_swedish()
         for key, info in MODELS.items():
+            if info["swedish_only"] and not has_sv:
+                continue
             self._win_model_keys.append(key)
-            model_labels.append(info["label"])
+            model_labels.append(model_label(key))
         try:
             model_idx = self._win_model_keys.index(self.model_key)
         except ValueError:
