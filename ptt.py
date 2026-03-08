@@ -45,6 +45,7 @@ import numpy as np
 CONFIG_DIR = os.path.expanduser("~/.config/ptt")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 PROMPT_PATH = os.path.join(CONFIG_DIR, "prompt.txt")
+POLISH_PROMPT_PATH = os.path.join(CONFIG_DIR, "polish_prompt.txt")
 LOG_DIR = os.path.expanduser("~/Library/Logs")
 LOG_PATH = os.path.join(LOG_DIR, "ptt.log")
 PID_PATH = os.path.join(CONFIG_DIR, "ptt.pid")
@@ -66,7 +67,8 @@ try:
 except Exception:
     pass
 
-_log_handlers = [logging.FileHandler(LOG_PATH)]
+_file_handler = logging.FileHandler(LOG_PATH)
+_log_handlers = [_file_handler]
 if os.isatty(2):  # Only add stderr handler when running in a terminal
     _log_handlers.append(logging.StreamHandler())
 logging.basicConfig(
@@ -76,6 +78,14 @@ logging.basicConfig(
     handlers=_log_handlers,
 )
 log = logging.getLogger("ptt")
+
+
+def set_logging_enabled(enabled: bool):
+    """Enable or disable file logging."""
+    if enabled:
+        _file_handler.setLevel(logging.INFO)
+    else:
+        _file_handler.setLevel(logging.CRITICAL + 1)
 
 # Suppress noisy third-party loggers
 for _name in ("httpx", "huggingface_hub", "tqdm"):
@@ -111,7 +121,7 @@ def model_label(key: str) -> str:
 
 SAMPLE_RATE = 16000
 BLOCK_DURATION = 0.1
-MIN_SPEECH_SECONDS = 0.3
+MIN_SPEECH_SECONDS = 0.5
 PAUSE_SECONDS = 0.8
 PRE_ROLL_SECONDS = 0.4
 CALIBRATION_SECONDS = 2.0
@@ -124,11 +134,16 @@ ANIM_INTERVAL = 3
 # ---------------------------------------------------------------------------
 
 HOTKEYS = {
-    "alt_r":  {"code": 61, "flag": 1 << 19, "label": "Höger Option (⌥)"},
-    "alt":    {"code": 58, "flag": 1 << 19, "label": "Vänster Option (⌥)"},
-    "ctrl_r": {"code": 62, "flag": 1 << 18, "label": "Höger Control (⌃)"},
-    "ctrl":   {"code": 59, "flag": 1 << 18, "label": "Vänster Control (⌃)"},
+    "alt_r":  {"code": 61, "flag": 1 << 19, "label_sv": "Höger ⌥ Option", "label_en": "Right ⌥ Option"},
+    "alt":    {"code": 58, "flag": 1 << 19, "label_sv": "Vänster ⌥ Option", "label_en": "Left ⌥ Option"},
+    "ctrl_r": {"code": 62, "flag": 1 << 18, "label_sv": "Höger ⌃ Control", "label_en": "Right ⌃ Control"},
+    "ctrl":   {"code": 59, "flag": 1 << 18, "label_sv": "Vänster ⌃ Control", "label_en": "Left ⌃ Control"},
 }
+
+
+def hotkey_label(key: str) -> str:
+    info = HOTKEYS[key]
+    return info["label_sv"] if system_has_swedish() else info["label_en"]
 
 # ---------------------------------------------------------------------------
 # Waveform icon definitions
@@ -154,31 +169,34 @@ _DEFAULT_SETTINGS = {
     "device": None,
     "autostart": False,
     "intro_shown": False,
+    "logging": True,
 }
 
 
-def detect_system_language() -> str:
-    try:
-        out = subprocess.run(
-            ["defaults", "read", "-g", "AppleLanguages"],
-            capture_output=True, text=True,
-        ).stdout.lower()
-        if "sv" in out:
-            return "sv"
-    except Exception:
-        pass
-    return "en"
+_SYS_SWEDISH: bool | None = None
 
 
 def system_has_swedish() -> bool:
-    try:
-        out = subprocess.run(
-            ["defaults", "read", "-g", "AppleLanguages"],
-            capture_output=True, text=True,
-        ).stdout.lower()
-        return "sv" in out
-    except Exception:
-        return False
+    global _SYS_SWEDISH
+    if _SYS_SWEDISH is None:
+        try:
+            out = subprocess.run(
+                ["defaults", "read", "-g", "AppleLanguages"],
+                capture_output=True, text=True,
+            ).stdout.lower()
+            _SYS_SWEDISH = "sv" in out
+        except Exception:
+            _SYS_SWEDISH = False
+    return _SYS_SWEDISH
+
+
+def detect_system_language() -> str:
+    return "sv" if system_has_swedish() else "en"
+
+
+def _t(sv: str, en: str) -> str:
+    """Return Swedish or English string based on system language."""
+    return sv if system_has_swedish() else en
 
 
 def load_settings() -> dict:
@@ -220,7 +238,7 @@ def read_prompt() -> str | None:
 def ensure_prompt_file():
     if not os.path.isfile(PROMPT_PATH):
         with open(PROMPT_PATH, "w") as f:
-            f.write(
+            f.write(_t(
                 "# PTT — Ordlista\n"
                 "#\n"
                 "# Skriv ord och namn som ofta hörs fel.\n"
@@ -228,8 +246,16 @@ def ensure_prompt_file():
                 "# Rader som börjar med # ignoreras.\n"
                 "#\n"
                 "# Exempel:\n"
-                "# Claude Code, Kajabi\n"
-            )
+                "# Claude Code, Kajabi\n",
+                "# PTT — Word hints\n"
+                "#\n"
+                "# Add words and names that are often misheard.\n"
+                "# One per line, or comma-separated.\n"
+                "# Lines starting with # are ignored.\n"
+                "#\n"
+                "# Example:\n"
+                "# Claude Code, Kajabi\n",
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +470,155 @@ def _kill_other_instances():
     with open(PID_PATH, "w") as f:
         f.write(str(os.getpid()))
 
+    # Clean up PID file on exit
+    import atexit
+    atexit.register(lambda: os.path.isfile(PID_PATH) and os.remove(PID_PATH))
+
+
+# ---------------------------------------------------------------------------
+# Groq polish (clean up spoken text)
+# ---------------------------------------------------------------------------
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+POLISH_PROMPT = (
+    "Du får talspråkig text från en rösttranskribering. "
+    "Gör om den till ren, tydlig skriven text. "
+    "Behåll innebörden exakt. Ta bort upprepningar, fyllnadsord och stakningar. "
+    "Svara BARA med den rensade texten, inget annat."
+)
+
+
+def _get_groq_key() -> str | None:
+    """Read Groq API key from macOS Keychain (tries account then service)."""
+    for flag in ("-a", "-s"):
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", flag, "groq", "-w"],
+                capture_output=True, text=True,
+            )
+            key = result.stdout.strip()
+            if key and not result.returncode:
+                return key
+        except Exception:
+            pass
+    return None
+
+
+def _set_groq_key(key: str) -> bool:
+    """Store Groq API key in macOS Keychain."""
+    # Remove old entry first (ignore errors)
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", "groq"],
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["security", "add-generic-password", "-a", "groq", "-s", "ptt", "-w", key],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _delete_groq_key() -> bool:
+    """Remove Groq API key from macOS Keychain."""
+    result = subprocess.run(
+        ["security", "delete-generic-password", "-a", "groq"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _read_polish_prompt(language: str) -> str:
+    """Read custom polish prompt or return default."""
+    if os.path.isfile(POLISH_PROMPT_PATH):
+        lines = []
+        for line in open(POLISH_PROMPT_PATH):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
+        custom = " ".join(lines).strip()
+        if custom:
+            return custom
+    if language == "en":
+        return (
+            "You receive spoken text from a voice transcription. "
+            "Clean it into clear, polished written text. "
+            "Keep the meaning exactly. Remove repetitions, filler words, and stutters. "
+            "Respond with ONLY the cleaned text, nothing else."
+        )
+    return POLISH_PROMPT
+
+
+def _ensure_polish_prompt_file():
+    """Create default polish prompt file if it doesn't exist."""
+    if not os.path.isfile(POLISH_PROMPT_PATH):
+        with open(POLISH_PROMPT_PATH, "w") as f:
+            f.write(_t(
+                "# PTT — Polerings-prompt\n"
+                "#\n"
+                "# Instruktioner till AI:n som polerar din text.\n"
+                "# Rader som börjar med # ignoreras.\n"
+                "# Lämna tom för standardprompt.\n"
+                "#\n"
+                "# Standardprompt (svenska):\n"
+                "# Du får talspråkig text från en rösttranskribering.\n"
+                "# Gör om den till ren, tydlig skriven text.\n"
+                "# Behåll innebörden exakt.\n"
+                "# Ta bort upprepningar, fyllnadsord och stakningar.\n"
+                "# Svara BARA med den rensade texten, inget annat.\n",
+                "# PTT — Polish prompt\n"
+                "#\n"
+                "# Instructions for the AI that polishes your text.\n"
+                "# Lines starting with # are ignored.\n"
+                "# Leave empty for default prompt.\n"
+                "#\n"
+                "# Default prompt (English):\n"
+                "# You receive spoken text from a voice transcription.\n"
+                "# Clean it into clear, polished written text.\n"
+                "# Keep the meaning exactly.\n"
+                "# Remove repetitions, filler words, and stutters.\n"
+                "# Respond with ONLY the cleaned text, nothing else.\n",
+            ))
+
+
+def polish_text(text: str, language: str) -> str | None:
+    """Send text to Groq to clean up spoken language."""
+    import urllib.request
+    import urllib.error
+
+    api_key = _get_groq_key()
+    if not api_key:
+        log.warning("No Groq API key — add via Settings or: security add-generic-password -a groq -s ptt -w KEY")
+        return None
+
+    system = _read_polish_prompt(language)
+
+    body = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.3,
+    }).encode()
+
+    req = urllib.request.Request(
+        GROQ_ENDPOINT,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error("Groq API error: %s", e)
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Settings window (native NSWindow via PyObjC)
@@ -495,6 +670,30 @@ def _get_delegate_class():
             if _ptt_ref:
                 _ptt_ref._on_edit_prompt()
 
+        def saveGroqKey_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_save_groq_key()
+
+        def removeGroqKey_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_remove_groq_key()
+
+        def loggingChanged_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._set_logging(sender.state() == 1)
+
+        def editPolishPrompt_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_edit_polish_prompt()
+
+        def clearLog_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_clear_log()
+
+        def openLog_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_open_log()
+
     _SettingsDelegate = _SD
     return _SettingsDelegate
 
@@ -520,6 +719,7 @@ class PTTApp:
 
         self.recording = False
         self.ready = False
+        self.polish_mode = False
         self.silence_threshold = MIN_THRESHOLD
 
         self.audio_queue: queue.Queue = queue.Queue()
@@ -543,6 +743,8 @@ class PTTApp:
         self._win_lang_codes: list = []
         self._win_model_keys: list = []
         self._win_hotkey_keys: list = []
+        self._groq_key_field = None
+        self._groq_status_label = None
 
     # ---- Persistence -----------------------------------------------------
 
@@ -564,11 +766,14 @@ class PTTApp:
 
     def _show_icon(self, nsimage):
         try:
-            b = self._app._nsapp.nsstatusitem.button()
-            b.setImage_(nsimage)
-            b.setTitle_("")
-        except Exception as e:
-            log.debug("_show_icon failed: %s", e)
+            si = self._app._nsapp.nsstatusitem
+            if si:
+                b = si.button()
+                if b:
+                    b.setImage_(nsimage)
+                    b.setTitle_("")
+        except Exception:
+            pass
 
     # ---- Menu ------------------------------------------------------------
 
@@ -589,24 +794,28 @@ class PTTApp:
         self._app = rumps.App("PTT", title="PTT", quit_button=None)
 
         self._app.menu = [
-            rumps.MenuItem("Inställningar…", callback=self._on_open_settings),
-            rumps.MenuItem("Visa logg…", callback=self._on_open_log),
+            rumps.MenuItem(_t("Inställningar…", "Settings…"), callback=self._on_open_settings),
+            rumps.MenuItem(_t("Visa logg…", "Show log…"), callback=self._on_open_log),
             None,
-            rumps.MenuItem("Avsluta", callback=self._on_quit),
+            rumps.MenuItem(_t("Avsluta", "Quit"), callback=self._on_quit),
         ]
 
         # Accessibility check
         if not check_accessibility():
             log.warning("Accessibility permission missing")
             rumps.alert(
-                title="PTT behöver Accessibility",
-                message=(
+                title=_t("PTT behöver Accessibility", "PTT needs Accessibility"),
+                message=_t(
                     "PTT behöver behörighet för att läsa tangenter "
                     "och klistra in text.\n\n"
                     "Lägg till appen i:\n"
-                    "Inställningar → Integritet och säkerhet → Hjälpmedel"
+                    "Inställningar → Integritet och säkerhet → Hjälpmedel",
+                    "PTT needs permission to read hotkeys "
+                    "and paste text.\n\n"
+                    "Add the app in:\n"
+                    "Settings → Privacy & Security → Accessibility",
                 ),
-                ok="Öppna inställningar",
+                ok=_t("Öppna inställningar", "Open Settings"),
             )
             subprocess.Popen([
                 "open",
@@ -632,7 +841,9 @@ class PTTApp:
         while time.monotonic() < deadline:
             try:
                 si = self._app._nsapp.nsstatusitem
-                if si and si.button():
+                if si is not None:
+                    # Give the main thread a moment to finish layout
+                    time.sleep(0.3)
                     return True
             except AttributeError:
                 pass
@@ -695,26 +906,33 @@ class PTTApp:
             self.ready = True
             self._show_icon(self._icon_idle)
 
-            label = HOTKEYS[self.hotkey]["label"]
+            label = hotkey_label(self.hotkey)
             log.info("PTT ready")
 
             # First-run intro
             if not self.settings.get("intro_shown"):
                 self._notify(
-                    "Redo!",
-                    f"Håll {label} och prata.\n"
-                    "Släpp för att transkribera och klistra in.\n"
-                    "Klicka ikonen för inställningar.",
+                    _t("Redo!", "Ready!"),
+                    _t(
+                        f"Håll {label} och prata.\n"
+                        "Släpp för att transkribera och klistra in.\n"
+                        "Klicka ikonen för inställningar.",
+                        f"Hold {label} and speak.\n"
+                        "Release to transcribe and paste.\n"
+                        "Click the icon for settings.",
+                    ),
                 )
                 self.settings["intro_shown"] = True
                 save_settings(self.settings)
             else:
-                self._notify("Redo!", f"Håll {label} och prata")
+                self._notify(
+                    _t("Redo!", "Ready!"),
+                    _t(f"Håll {label} och prata", f"Hold {label} and speak"),
+                )
 
         except Exception as e:
             log.exception("Init failed")
-            pass  # error already logged and notified
-            self._notify("Kunde inte starta", str(e))
+            self._notify(_t("Kunde inte starta", "Failed to start"), str(e))
 
     def _calibrate(self):
         import sounddevice as sd
@@ -734,8 +952,14 @@ class PTTApp:
     def _on_modifier(self, event):
         if not self.ready or event.keyCode() != self.hotkey_code:
             return
-        pressed = bool(event.modifierFlags() & self.hotkey_flag)
+        flags = event.modifierFlags()
+        pressed = bool(flags & self.hotkey_flag)
+        cmd_held = bool(flags & (1 << 20))  # NSEventModifierFlagCommand
+
         if pressed and not self.recording:
+            self.polish_mode = cmd_held
+            if self.polish_mode:
+                log.info("Polish mode ON")
             self._start_rec()
         elif not pressed and self.recording:
             self._stop_rec()
@@ -743,6 +967,8 @@ class PTTApp:
     # ---- Recording -------------------------------------------------------
 
     def _audio_cb(self, indata, frames, time_info, status):
+        if status:
+            log.warning("Audio: %s", status)
         block = indata.copy()
         if self.recording:
             self.audio_queue.put(block)
@@ -752,6 +978,22 @@ class PTTApp:
     def _start_rec(self):
         if self._rec_thread and self._rec_thread.is_alive():
             return
+
+        # Restart audio stream if it died
+        if self._stream and not self._stream.active:
+            log.warning("Audio stream inactive, restarting")
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            import sounddevice as sd
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1,
+                blocksize=self.block_size, device=self.device_idx,
+                callback=self._audio_cb,
+            )
+            self._stream.start()
+
         self.recording = True
         self._show_icon(self._icon_rec[0])
         log.info("REC start")
@@ -778,11 +1020,19 @@ class PTTApp:
         has_speech = False
         block_n = 0
         frame = 0
+        polish_parts: list[str] = []
+        empty_polls = 0
 
         while self.recording:
             try:
                 block = self.audio_queue.get(timeout=0.05)
+                empty_polls = 0
             except queue.Empty:
+                empty_polls += 1
+                # If no audio for 3+ seconds, stream may be dead
+                if empty_polls > 60:
+                    log.warning("No audio data for 3s — stream may be dead")
+                    empty_polls = 0
                 continue
 
             block_n += 1
@@ -800,14 +1050,37 @@ class PTTApp:
                 speech_buf.append(block)
                 silent_blocks += 1
                 if silent_blocks * BLOCK_DURATION >= PAUSE_SECONDS:
-                    self._transcribe(list(speech_buf))
+                    text = self._transcribe(list(speech_buf))
+                    if self.polish_mode and text:
+                        polish_parts.append(text)
                     speech_buf.clear()
                     silent_blocks = 0
                     has_speech = False
 
         if speech_buf and has_speech:
-            self._transcribe(speech_buf)
+            text = self._transcribe(speech_buf)
+            if self.polish_mode and text:
+                polish_parts.append(text)
 
+        if self.polish_mode and polish_parts:
+            raw = " ".join(polish_parts)
+            log.info("Polish mode: sending %d chars to Groq", len(raw))
+            self._show_icon(self._icon_busy)
+            polished = polish_text(raw, self.language)
+            if polished:
+                try:
+                    paste_text(polished + " ")
+                    log.info("Polished and pasted %d chars (was %d)", len(polished), len(raw))
+                except Exception:
+                    log.exception("Paste failed after polish")
+            else:
+                log.warning("Polish failed, pasting raw text")
+                try:
+                    paste_text(raw + " ")
+                except Exception:
+                    log.exception("Paste failed")
+
+        self.polish_mode = False
         self._show_icon(self._icon_idle)
 
     # ---- Transcription ---------------------------------------------------
@@ -818,7 +1091,7 @@ class PTTApp:
         audio = np.concatenate(blocks).flatten().astype(np.float32)
         duration = len(audio) / SAMPLE_RATE
         if duration < MIN_SPEECH_SECONDS:
-            return
+            return None
 
         self._show_icon(self._icon_busy)
         t0 = time.monotonic()
@@ -837,15 +1110,20 @@ class PTTApp:
             log.exception("Transcription error")
             if self.recording:
                 self._show_icon(self._icon_rec[0])
-            return
+            return None
 
         elapsed = time.monotonic() - t0
         text = result.get("text", "").strip()
 
         if text and not is_hallucination(text):
+            speed = duration / elapsed if elapsed > 0 else 0
+            if self.polish_mode:
+                log.info("Buffered %d chars for polish  (%.1fs -> %.1fs, %.0fx)", len(text), duration, elapsed, speed)
+                if self.recording:
+                    self._show_icon(self._icon_rec[0])
+                return text
             try:
                 paste_text(text + " ")
-                speed = duration / elapsed if elapsed > 0 else 0
                 log.info("Pasted %d chars  (%.1fs -> %.1fs, %.0fx)", len(text), duration, elapsed, speed)
             except Exception:
                 log.exception("Paste failed -- text in clipboard")
@@ -854,6 +1132,7 @@ class PTTApp:
 
         if self.recording:
             self._show_icon(self._icon_rec[0])
+        return None
 
     # ---- Settings: internal setters --------------------------------------
 
@@ -871,7 +1150,7 @@ class PTTApp:
         self.model_repo = MODELS[key]["repo"]
         self._save()
         log.info("Model -> %s", key)
-        self._notify("Byter modell…", model_label(key))
+        self._notify(_t("Byter modell…", "Switching model…"), model_label(key))
 
         def preload():
             self._show_icon(self._icon_busy)
@@ -884,10 +1163,10 @@ class PTTApp:
                     language=self.language,
                 )
     
-                self._notify("Modell laddad", model_label(key))
+                self._notify(_t("Modell laddad", "Model loaded"), model_label(key))
             except Exception as e:
                 log.exception("Model switch failed")
-                self._notify("Fel vid modellbyte", str(e))
+                self._notify(_t("Fel vid modellbyte", "Model switch failed"), str(e))
             self._show_icon(self._icon_idle)
 
         threading.Thread(target=preload, daemon=True).start()
@@ -901,22 +1180,30 @@ class PTTApp:
         self.hotkey_flag = hk["flag"]
         self._save()
         log.info("Hotkey -> %s", key)
-        self._notify("Tangent ändrad", hk["label"])
+        self._notify(_t("Tangent ändrad", "Hotkey changed"), hotkey_label(key))
+
+    def _set_logging(self, enabled: bool):
+        self.settings["logging"] = enabled
+        save_settings(self.settings)
+        set_logging_enabled(enabled)
+        log.info("Logging -> %s", "on" if enabled else "off")
 
     def _set_autostart(self, enabled: bool):
         self.settings["autostart"] = enabled
         save_settings(self.settings)
         set_autostart(enabled)
-        msg = "Startar automatiskt vid inloggning" if enabled else "Autostart avstängd"
+        msg = _t(
+            "Startar automatiskt vid inloggning" if enabled else "Autostart avstängd",
+            "Starts automatically at login" if enabled else "Autostart disabled",
+        )
         self._notify("Autostart", msg)
 
     # ---- Settings window -------------------------------------------------
 
     def _on_open_settings(self, _sender=None):
         from AppKit import (
-            NSWindow, NSTextField, NSPopUpButton, NSButton,
-            NSFont, NSApp, NSBackingStoreBuffered, NSTextView,
-            NSScrollView, NSBorderlessWindowMask,
+            NSWindow, NSTextField, NSSecureTextField, NSPopUpButton, NSButton,
+            NSFont, NSApp, NSBackingStoreBuffered, NSColor, NSBox,
         )
         from Foundation import NSMakeRect
 
@@ -930,22 +1217,26 @@ class PTTApp:
         delegate = DelegateCls.alloc().init()
         self._settings_delegate = delegate  # prevent GC
 
-        W, H = 400, 440
+        W, H = 420, 680
         style = 1 | 2  # NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False
         )
-        win.setTitle_("PTT — Inställningar")
+        win.setTitle_(_t("PTT — Inställningar", "PTT — Settings"))
         win.center()
 
         content = win.contentView()
-        y = H - 50
+        y = H - 40
         LX = 20       # label x
-        PX = 160      # popup x
-        PW = 210      # popup width
+        PX = 170      # popup x
+        PW = 220      # popup width
+        BX = 295      # button x
+        BW = 100      # button width
+        sec = NSColor.secondaryLabelColor()
+        ter = NSColor.tertiaryLabelColor()
 
-        def add_label(text, x, yy, w=340, bold=False, size=12):
+        def add_label(text, x, yy, w=370, bold=False, size=12, color=None):
             tf = NSTextField.alloc().initWithFrame_(NSMakeRect(x, yy, w, 18))
             tf.setStringValue_(text)
             tf.setBezeled_(False)
@@ -956,6 +1247,8 @@ class PTTApp:
                 tf.setFont_(NSFont.boldSystemFontOfSize_(size))
             else:
                 tf.setFont_(NSFont.systemFontOfSize_(size))
+            if color:
+                tf.setTextColor_(color)
             content.addSubview_(tf)
             return tf
 
@@ -972,8 +1265,33 @@ class PTTApp:
             content.addSubview_(popup)
             return popup
 
-        # --- Language ---
-        add_label("Språk", LX, y)
+        def add_btn(title, yy, action_sel, x=BX, w=BW):
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, yy - 4, w, 28))
+            btn.setTitle_(title)
+            btn.setBezelStyle_(1)
+            btn.setTarget_(delegate)
+            btn.setAction_(action_sel)
+            content.addSubview_(btn)
+            return btn
+
+        def add_separator(yy):
+            sep = NSBox.alloc().initWithFrame_(NSMakeRect(LX, yy, W - 40, 1))
+            sep.setBoxType_(2)  # NSBoxSeparator
+            content.addSubview_(sep)
+            return sep
+
+        # ── TRANSCRIPTION ──────────────────────────────────────
+        add_label(_t("Transkribering", "Transcription"), LX, y, bold=True, size=13)
+        y -= 8
+        add_label(
+            _t("Håll tangenten, prata, släpp — texten klistras in",
+               "Hold hotkey, speak, release — text is pasted"),
+            LX, y, size=11, color=sec,
+        )
+        y -= 30
+
+        # Language
+        add_label(_t("Språk", "Language"), LX, y)
         self._win_lang_codes = []
         lang_labels = []
         available_langs = [("en", "English")]
@@ -987,86 +1305,142 @@ class PTTApp:
         except ValueError:
             lang_idx = 0
         add_popup(lang_labels, lang_idx, "langChanged:", y)
+        y -= 32
 
-        y -= 38
-
-        # --- Model ---
-        add_label("Modell", LX, y)
+        # Model
+        add_label(_t("Modell", "Model"), LX, y)
         self._win_model_keys = []
-        model_labels = []
+        model_labels_list = []
         has_sv = system_has_swedish()
         for key, info in MODELS.items():
             if info["swedish_only"] and not has_sv:
                 continue
             self._win_model_keys.append(key)
-            model_labels.append(model_label(key))
+            model_labels_list.append(model_label(key))
         try:
             model_idx = self._win_model_keys.index(self.model_key)
         except ValueError:
             model_idx = 0
-        add_popup(model_labels, model_idx, "modelChanged:", y)
+        add_popup(model_labels_list, model_idx, "modelChanged:", y)
+        y -= 32
 
-        y -= 38
-
-        # --- Hotkey ---
-        add_label("Tangent", LX, y)
+        # Hotkey
+        add_label(_t("Tangent", "Hotkey"), LX, y)
         self._win_hotkey_keys = []
-        hotkey_labels = []
+        hk_labels = []
         for key, info in HOTKEYS.items():
             self._win_hotkey_keys.append(key)
-            hotkey_labels.append(info["label"])
+            hk_labels.append(hotkey_label(key))
         try:
             hotkey_idx = self._win_hotkey_keys.index(self.hotkey)
         except ValueError:
             hotkey_idx = 0
-        add_popup(hotkey_labels, hotkey_idx, "hotkeyChanged:", y)
+        add_popup(hk_labels, hotkey_idx, "hotkeyChanged:", y)
+        y -= 32
 
-        y -= 50
+        # Microphone
+        add_label(_t("Mikrofon", "Microphone"), LX, y)
+        mic_text = self.device_name if self.device_name else _t("Ej identifierad", "Not detected")
+        add_label(mic_text, PX, y, w=120, size=11, color=sec)
+        add_btn(_t("Kalibrera", "Calibrate"), y, "calibrateClicked:")
+        y -= 32
 
-        # --- Microphone ---
-        add_label("Mikrofon", LX, y, bold=True)
-        y -= 24
-        mic_text = self.device_name if self.device_name else "Inte initierad"
-        add_label(mic_text, LX, y, w=220)
+        # Word hints
+        add_label(
+            _t("Ordlista", "Vocabulary"),
+            LX, y,
+        )
+        add_label(
+            _t("Förbättra igenkänning av namn och termer",
+               "Improve recognition of names and terms"),
+            PX, y, w=140, size=11, color=sec,
+        )
+        add_btn(_t("Redigera…", "Edit…"), y, "editPromptClicked:")
 
-        cal_btn = NSButton.alloc().initWithFrame_(NSMakeRect(280, y - 4, 95, 28))
-        cal_btn.setTitle_("Kalibrera")
-        cal_btn.setBezelStyle_(1)  # rounded
-        cal_btn.setTarget_(delegate)
-        cal_btn.setAction_("calibrateClicked:")
-        content.addSubview_(cal_btn)
+        y -= 20
+        add_separator(y)
+        y -= 16
 
-        y -= 45
+        # ── TEXT POLISH ────────────────────────────────────────
+        hk_lbl = hotkey_label(self.hotkey)
+        add_label(_t("Textpolering", "Text polish"), LX, y, bold=True, size=13)
+        y -= 8
+        add_label(
+            _t(f"Håll ⌘ + tangent för att rensa talspråk",
+               f"Hold ⌘ + hotkey to clean up spoken text"),
+            LX, y, size=11, color=sec,
+        )
+        y -= 18
+        add_label(
+            _t("Texten skickas till Groq (groq.com) för bearbetning",
+               "Text is sent to Groq (groq.com) for processing"),
+            LX, y, size=10, color=ter,
+        )
+        y -= 26
 
-        # --- Word hints ---
-        add_label("Ordlista", LX, y, bold=True)
-        y -= 24
-        add_label("Ord som Whisper ofta missar", LX, y, w=220)
+        has_key = _get_groq_key() is not None
+        add_label("Groq API", LX, y)
+        if has_key:
+            add_label(
+                _t("Nyckel sparad ✓", "Key saved ✓"),
+                PX, y, w=140, size=11,
+                color=NSColor.systemGreenColor(),
+            )
+            add_btn(_t("Ta bort", "Remove"), y, "removeGroqKey:")
+        else:
+            key_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(PX, y - 2, 110, 24))
+            key_field.setPlaceholderString_("gsk_...")
+            key_field.setFont_(NSFont.systemFontOfSize_(11))
+            content.addSubview_(key_field)
+            self._groq_key_field = key_field
+            add_btn(_t("Spara", "Save"), y, "saveGroqKey:")
+        y -= 32
 
-        edit_btn = NSButton.alloc().initWithFrame_(NSMakeRect(280, y - 4, 95, 28))
-        edit_btn.setTitle_("Redigera…")
-        edit_btn.setBezelStyle_(1)
-        edit_btn.setTarget_(delegate)
-        edit_btn.setAction_("editPromptClicked:")
-        content.addSubview_(edit_btn)
+        # Polish prompt
+        add_label(
+            _t("Prompt", "Prompt"),
+            LX, y,
+        )
+        add_label(
+            _t("Instruktioner till AI:n", "Instructions for the AI"),
+            PX, y, w=140, size=11, color=sec,
+        )
+        add_btn(_t("Redigera…", "Edit…"), y, "editPolishPrompt:")
 
-        y -= 50
+        y -= 20
+        add_separator(y)
+        y -= 16
 
-        # --- Autostart ---
+        # ── GENERAL ───────────────────────────────────────────
+        add_label(_t("Övrigt", "General"), LX, y, bold=True, size=13)
+        y -= 28
+
         autostart_btn = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 300, 22))
-        autostart_btn.setButtonType_(3)  # switch/checkbox
-        autostart_btn.setTitle_("Starta PTT vid inloggning")
+        autostart_btn.setButtonType_(3)  # checkbox
+        autostart_btn.setTitle_(_t("Starta PTT vid inloggning", "Start PTT at login"))
         autostart_btn.setState_(1 if self.settings.get("autostart") else 0)
         autostart_btn.setTarget_(delegate)
         autostart_btn.setAction_("autostartChanged:")
         content.addSubview_(autostart_btn)
+        y -= 26
 
-        y -= 40
+        log_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 250, 22))
+        log_chk.setButtonType_(3)  # checkbox
+        log_chk.setTitle_(_t("Logga till fil", "Log to file"))
+        log_chk.setState_(1 if self.settings.get("logging", True) else 0)
+        log_chk.setTarget_(delegate)
+        log_chk.setAction_("loggingChanged:")
+        content.addSubview_(log_chk)
+        add_btn(_t("Rensa", "Clear"), y, "clearLog:", x=BX - 50, w=60)
+        add_btn(_t("Visa", "View"), y, "openLog:", x=BX + 20, w=60)
+
+        y -= 34
 
         # --- Footer ---
         add_label(
-            "PTT — lokal transkribering med MLX Whisper",
-            LX, y, w=360, size=10,
+            _t("PTT — lokal transkribering med MLX Whisper",
+               "PTT — local transcription with MLX Whisper"),
+            LX, y, w=360, size=10, color=ter,
         )
 
         self._settings_win = win
@@ -1076,13 +1450,70 @@ class PTTApp:
     # ---- Action callbacks ------------------------------------------------
 
     def _on_edit_prompt(self, _sender=None):
+        ensure_prompt_file()
         subprocess.Popen(["open", "-t", PROMPT_PATH])
+
+    def _on_edit_polish_prompt(self, _sender=None):
+        _ensure_polish_prompt_file()
+        subprocess.Popen(["open", "-t", POLISH_PROMPT_PATH])
+
+    def _on_clear_log(self, _sender=None):
+        try:
+            open(LOG_PATH, "w").close()
+            log.info("Log cleared")
+            self._notify(
+                _t("Logg rensad", "Log cleared"),
+                "ptt.log",
+            )
+        except Exception:
+            pass
+
+    def _on_save_groq_key(self, _sender=None):
+        if not self._groq_key_field:
+            return
+        key = str(self._groq_key_field.stringValue()).strip()
+        if not key:
+            return
+        if _set_groq_key(key):
+            log.info("Groq API key saved")
+            self._notify(
+                _t("Nyckel sparad", "Key saved"),
+                _t("Groq API-nyckel sparad i Keychain", "Groq API key saved to Keychain"),
+            )
+            # Refresh settings window
+            if self._settings_win:
+                self._settings_win.close()
+                self._settings_win = None
+                self._on_open_settings()
+        else:
+            self._notify(
+                _t("Fel", "Error"),
+                _t("Kunde inte spara nyckeln", "Could not save key"),
+            )
+
+    def _on_remove_groq_key(self, _sender=None):
+        _delete_groq_key()
+        log.info("Groq API key removed")
+        self._notify(
+            _t("Nyckel borttagen", "Key removed"),
+            _t("Groq API-nyckel borttagen", "Groq API key removed"),
+        )
+        if self._settings_win:
+            self._settings_win.close()
+            self._settings_win = None
+            self._on_open_settings()
 
     def _on_recalibrate(self, _sender=None):
         def do():
-            self._notify("Kalibrerar…", "Var tyst i 2 sekunder")
+            self._notify(
+                _t("Kalibrerar…", "Calibrating…"),
+                _t("Var tyst i 2 sekunder", "Stay quiet for 2 seconds"),
+            )
             self._calibrate()
-            self._notify("Klart!", f"Tröskel: {self.silence_threshold:.4f}")
+            self._notify(
+                _t("Klart!", "Done!"),
+                f"{_t('Tröskel', 'Threshold')}: {self.silence_threshold:.4f}",
+            )
         threading.Thread(target=do, daemon=True).start()
 
     def _on_open_log(self, _sender=None):
@@ -1178,6 +1609,9 @@ def main():
     if args.device is not None:
         settings["device"] = args.device
     save_settings(settings)
+
+    # Apply logging setting
+    set_logging_enabled(settings.get("logging", True))
 
     PTTApp(settings).run()
 

@@ -1,0 +1,23 @@
+#!/bin/bash
+# PTT — Push-to-Talk Transcription launcher
+# This script finds uv and runs ptt.py
+
+DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+
+# Find uv
+UV=""
+for p in "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv" "/opt/homebrew/bin/uv" "/usr/local/bin/uv"; do
+    [ -x "$p" ] && UV="$p" && break
+done
+
+if [ -z "$UV" ]; then
+    UV="$(which uv 2>/dev/null)"
+fi
+
+if [ -z "$UV" ]; then
+    osascript -e 'display alert "PTT" message "uv is required but not installed.\n\nInstall with:\nbrew install uv\n\nOr visit: https://docs.astral.sh/uv/" as warning'
+    exit 1
+fi
+
+export UV_HTTP_TIMEOUT=300
+exec "$UV" run --script "$DIR/ptt.py"
