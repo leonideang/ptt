@@ -223,39 +223,50 @@ def save_settings(settings: dict):
 # ---------------------------------------------------------------------------
 
 
-def read_prompt() -> str | None:
-    if not os.path.isfile(PROMPT_PATH):
+def _read_commented_file(path: str, sep: str = ", ") -> str | None:
+    """Read a config file, stripping comments (#) and blank lines."""
+    if not os.path.isfile(path):
         return None
     lines = []
-    for line in open(PROMPT_PATH):
+    for line in open(path):
         line = line.strip()
         if line and not line.startswith("#"):
             lines.append(line)
-    text = ", ".join(lines).strip()
+    text = sep.join(lines).strip()
     return text if text else None
 
 
+def read_prompt() -> str | None:
+    return _read_commented_file(PROMPT_PATH, sep=", ")
+
+
+def _ensure_config_file(path: str, sv_template: str, en_template: str):
+    """Create a config file with localized template if it doesn't exist."""
+    if not os.path.isfile(path):
+        with open(path, "w") as f:
+            f.write(_t(sv_template, en_template))
+
+
 def ensure_prompt_file():
-    if not os.path.isfile(PROMPT_PATH):
-        with open(PROMPT_PATH, "w") as f:
-            f.write(_t(
-                "# PTT — Ordlista\n"
-                "#\n"
-                "# Skriv ord och namn som ofta hörs fel.\n"
-                "# En post per rad, eller kommaseparerat.\n"
-                "# Rader som börjar med # ignoreras.\n"
-                "#\n"
-                "# Exempel:\n"
-                "# Claude Code, Kajabi\n",
-                "# PTT — Word hints\n"
-                "#\n"
-                "# Add words and names that are often misheard.\n"
-                "# One per line, or comma-separated.\n"
-                "# Lines starting with # are ignored.\n"
-                "#\n"
-                "# Example:\n"
-                "# Claude Code, Kajabi\n",
-            ))
+    _ensure_config_file(
+        PROMPT_PATH,
+        "# PTT — Ordlista\n"
+        "#\n"
+        "# Skriv ord och namn som ofta hörs fel.\n"
+        "# En post per rad, eller kommaseparerat.\n"
+        "# Rader som börjar med # ignoreras.\n"
+        "#\n"
+        "# Exempel:\n"
+        "# Claude Code, Kajabi\n",
+        "# PTT — Word hints\n"
+        "#\n"
+        "# Add words and names that are often misheard.\n"
+        "# One per line, or comma-separated.\n"
+        "# Lines starting with # are ignored.\n"
+        "#\n"
+        "# Example:\n"
+        "# Claude Code, Kajabi\n",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +483,14 @@ def _kill_other_instances():
 
     # Clean up PID file on exit
     import atexit
-    atexit.register(lambda: os.path.isfile(PID_PATH) and os.remove(PID_PATH))
+
+    def _cleanup_pid():
+        try:
+            os.remove(PID_PATH)
+        except OSError:
+            pass
+
+    atexit.register(_cleanup_pid)
 
 
 # ---------------------------------------------------------------------------
@@ -489,8 +507,14 @@ POLISH_PROMPT = (
 )
 
 
+_groq_key_cache: str | None | bool = False  # False = not yet looked up
+
+
 def _get_groq_key() -> str | None:
-    """Read Groq API key from macOS Keychain (tries account then service)."""
+    """Read Groq API key from macOS Keychain (cached, tries account then service)."""
+    global _groq_key_cache
+    if _groq_key_cache is not False:
+        return _groq_key_cache
     for flag in ("-a", "-s"):
         try:
             result = subprocess.run(
@@ -499,15 +523,17 @@ def _get_groq_key() -> str | None:
             )
             key = result.stdout.strip()
             if key and not result.returncode:
+                _groq_key_cache = key
                 return key
         except Exception:
             pass
+    _groq_key_cache = None
     return None
 
 
 def _set_groq_key(key: str) -> bool:
     """Store Groq API key in macOS Keychain."""
-    # Remove old entry first (ignore errors)
+    global _groq_key_cache
     subprocess.run(
         ["security", "delete-generic-password", "-a", "groq"],
         capture_output=True,
@@ -516,29 +542,27 @@ def _set_groq_key(key: str) -> bool:
         ["security", "add-generic-password", "-a", "groq", "-s", "ptt", "-w", key],
         capture_output=True,
     )
-    return result.returncode == 0
+    ok = result.returncode == 0
+    _groq_key_cache = key if ok else False
+    return ok
 
 
 def _delete_groq_key() -> bool:
     """Remove Groq API key from macOS Keychain."""
+    global _groq_key_cache
     result = subprocess.run(
         ["security", "delete-generic-password", "-a", "groq"],
         capture_output=True,
     )
+    _groq_key_cache = False
     return result.returncode == 0
 
 
 def _read_polish_prompt(language: str) -> str:
     """Read custom polish prompt or return default."""
-    if os.path.isfile(POLISH_PROMPT_PATH):
-        lines = []
-        for line in open(POLISH_PROMPT_PATH):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                lines.append(line)
-        custom = " ".join(lines).strip()
-        if custom:
-            return custom
+    custom = _read_commented_file(POLISH_PROMPT_PATH, sep=" ")
+    if custom:
+        return custom
     if language == "en":
         return (
             "You receive spoken text from a voice transcription. "
@@ -551,34 +575,33 @@ def _read_polish_prompt(language: str) -> str:
 
 def _ensure_polish_prompt_file():
     """Create default polish prompt file if it doesn't exist."""
-    if not os.path.isfile(POLISH_PROMPT_PATH):
-        with open(POLISH_PROMPT_PATH, "w") as f:
-            f.write(_t(
-                "# PTT — Polerings-prompt\n"
-                "#\n"
-                "# Instruktioner till AI:n som polerar din text.\n"
-                "# Rader som börjar med # ignoreras.\n"
-                "# Lämna tom för standardprompt.\n"
-                "#\n"
-                "# Standardprompt (svenska):\n"
-                "# Du får talspråkig text från en rösttranskribering.\n"
-                "# Gör om den till ren, tydlig skriven text.\n"
-                "# Behåll innebörden exakt.\n"
-                "# Ta bort upprepningar, fyllnadsord och stakningar.\n"
-                "# Svara BARA med den rensade texten, inget annat.\n",
-                "# PTT — Polish prompt\n"
-                "#\n"
-                "# Instructions for the AI that polishes your text.\n"
-                "# Lines starting with # are ignored.\n"
-                "# Leave empty for default prompt.\n"
-                "#\n"
-                "# Default prompt (English):\n"
-                "# You receive spoken text from a voice transcription.\n"
-                "# Clean it into clear, polished written text.\n"
-                "# Keep the meaning exactly.\n"
-                "# Remove repetitions, filler words, and stutters.\n"
-                "# Respond with ONLY the cleaned text, nothing else.\n",
-            ))
+    _ensure_config_file(
+        POLISH_PROMPT_PATH,
+        "# PTT — Polerings-prompt\n"
+        "#\n"
+        "# Instruktioner till AI:n som polerar din text.\n"
+        "# Rader som börjar med # ignoreras.\n"
+        "# Lämna tom för standardprompt.\n"
+        "#\n"
+        "# Standardprompt (svenska):\n"
+        "# Du får talspråkig text från en rösttranskribering.\n"
+        "# Gör om den till ren, tydlig skriven text.\n"
+        "# Behåll innebörden exakt.\n"
+        "# Ta bort upprepningar, fyllnadsord och stakningar.\n"
+        "# Svara BARA med den rensade texten, inget annat.\n",
+        "# PTT — Polish prompt\n"
+        "#\n"
+        "# Instructions for the AI that polishes your text.\n"
+        "# Lines starting with # are ignored.\n"
+        "# Leave empty for default prompt.\n"
+        "#\n"
+        "# Default prompt (English):\n"
+        "# You receive spoken text from a voice transcription.\n"
+        "# Clean it into clear, polished written text.\n"
+        "# Keep the meaning exactly.\n"
+        "# Remove repetitions, filler words, and stutters.\n"
+        "# Respond with ONLY the cleaned text, nothing else.\n",
+    )
 
 
 def polish_text(text: str, language: str) -> str | None:
@@ -878,13 +901,7 @@ class PTTApp:
 
             self._calibrate()
 
-            self._stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                blocksize=self.block_size,
-                device=self.device_idx,
-                callback=self._audio_cb,
-            )
+            self._stream = self._create_stream()
             self._stream.start()
 
             mask = 1 << 12  # NSEventMaskFlagsChanged
@@ -933,6 +950,14 @@ class PTTApp:
         except Exception as e:
             log.exception("Init failed")
             self._notify(_t("Kunde inte starta", "Failed to start"), str(e))
+
+    def _create_stream(self):
+        import sounddevice as sd
+        return sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1,
+            blocksize=self.block_size, device=self.device_idx,
+            callback=self._audio_cb,
+        )
 
     def _calibrate(self):
         import sounddevice as sd
@@ -986,12 +1011,7 @@ class PTTApp:
                 self._stream.close()
             except Exception:
                 pass
-            import sounddevice as sd
-            self._stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1,
-                blocksize=self.block_size, device=self.device_idx,
-                callback=self._audio_cb,
-            )
+            self._stream = self._create_stream()
             self._stream.start()
 
         self.recording = True
@@ -1362,7 +1382,6 @@ class PTTApp:
         y -= 16
 
         # ── TEXT POLISH ────────────────────────────────────────
-        hk_lbl = hotkey_label(self.hotkey)
         add_label(_t("Textpolering", "Text polish"), LX, y, bold=True, size=13)
         y -= 8
         add_label(
@@ -1527,12 +1546,6 @@ class PTTApp:
                 self._stream.stop()
             except Exception:
                 pass
-        # Clean up PID file
-        try:
-            if os.path.isfile(PID_PATH):
-                os.remove(PID_PATH)
-        except Exception:
-            pass
         rumps.quit_application()
 
 
