@@ -10,9 +10,9 @@
 #     "pyobjc-framework-ApplicationServices>=10.0",
 # ]
 # ///
-"""PTT — Push-to-Talk Transcription for macOS (Apple Silicon).
+"""PTT -- Push-to-Talk Transcription for macOS (Apple Silicon).
 
-Hold a key, speak, release — text appears where your cursor is.
+Hold a key, speak, release -- text appears where your cursor is.
 Runs on-device with MLX Whisper. No cloud, no API keys.
 
 Usage:
@@ -77,6 +77,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("ptt")
 
+# Suppress noisy third-party loggers
+for _name in ("httpx", "huggingface_hub", "tqdm"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -84,11 +88,11 @@ log = logging.getLogger("ptt")
 MODELS = {
     "turbo": {
         "repo": "mlx-community/whisper-large-v3-turbo",
-        "label": "Turbo — snabb, bra på alla språk",
+        "label": "Turbo -- snabb, alla sprak",
     },
     "kb-sv": {
         "repo": "bratland/kb-whisper-large-mlx",
-        "label": "KB Swedish — bäst på svenska",
+        "label": "KB Swedish -- bast pa svenska",
     },
 }
 
@@ -111,10 +115,10 @@ ANIM_INTERVAL = 3
 # ---------------------------------------------------------------------------
 
 HOTKEYS = {
-    "alt_r":  {"code": 61, "flag": 1 << 19, "label": "Höger Option (⌥)"},
-    "alt":    {"code": 58, "flag": 1 << 19, "label": "Vänster Option (⌥)"},
-    "ctrl_r": {"code": 62, "flag": 1 << 18, "label": "Höger Control (⌃)"},
-    "ctrl":   {"code": 59, "flag": 1 << 18, "label": "Vänster Control (⌃)"},
+    "alt_r":  {"code": 61, "flag": 1 << 19, "label": "Hoger Option"},
+    "alt":    {"code": 58, "flag": 1 << 19, "label": "Vanster Option"},
+    "ctrl_r": {"code": 62, "flag": 1 << 18, "label": "Hoger Control"},
+    "ctrl":   {"code": 59, "flag": 1 << 18, "label": "Vanster Control"},
 }
 
 # ---------------------------------------------------------------------------
@@ -140,6 +144,7 @@ _DEFAULT_SETTINGS = {
     "hotkey": "alt_r",
     "device": None,
     "autostart": False,
+    "intro_shown": False,
 }
 
 
@@ -207,11 +212,11 @@ def ensure_prompt_file():
     if not os.path.isfile(PROMPT_PATH):
         with open(PROMPT_PATH, "w") as f:
             f.write(
-                "# PTT — Ordlista\n"
+                "# PTT -- Ordlista\n"
                 "#\n"
-                "# Skriv ord och namn som ofta hörs fel.\n"
+                "# Skriv ord och namn som ofta hors fel.\n"
                 "# En post per rad, eller kommaseparerat.\n"
-                "# Rader som börjar med # ignoreras.\n"
+                "# Rader som borjar med # ignoreras.\n"
                 "#\n"
                 "# Exempel:\n"
                 "# Claude Code, Kajabi\n"
@@ -224,7 +229,7 @@ def ensure_prompt_file():
 
 _ARTIFACTS = frozenset({
     "thank you", "thanks for watching", "subscribe", "you",
-    "tack för att ni tittade", "tack för att ni tittar",
+    "tack for att ni tittade", "tack for att ni tittar",
     "undertextning", "musik", "textning", "textning.nu",
     "untertitelung", "sous-titrage", "amara.org",
     "text", ".", "..", "...",
@@ -235,7 +240,7 @@ def is_hallucination(text: str) -> bool:
     t = text.strip().lower()
     if not t or len(t) <= 1:
         return True
-    if t[0] in "([♪♫":
+    if t[0] in "([":
         return True
     if t in _ARTIFACTS:
         return True
@@ -271,6 +276,9 @@ def find_builtin_mic() -> tuple[int | None, str]:
         if d["max_input_channels"] <= 0:
             continue
         name = d["name"].lower()
+        # Skip speakers / output devices that happen to match
+        if any(w in name for w in ("högtalare", "speaker", "output", "hdmi")):
+            continue
         if any(w in name for w in ("macbook", "built-in", "mikrofon", "internal")):
             return i, d["name"]
     idx = sd.default.device[0]
@@ -406,13 +414,12 @@ def set_autostart(enabled: bool):
 
 
 # ---------------------------------------------------------------------------
-# App
+# Instance management
 # ---------------------------------------------------------------------------
 
 
 def _kill_other_instances():
     """Kill any previous PTT instance using a PID file."""
-    # Kill previous instance from PID file
     if os.path.isfile(PID_PATH):
         try:
             old_pid = int(open(PID_PATH).read().strip())
@@ -425,9 +432,67 @@ def _kill_other_instances():
         except Exception:
             pass
 
-    # Write our PID
     with open(PID_PATH, "w") as f:
         f.write(str(os.getpid()))
+
+
+# ---------------------------------------------------------------------------
+# Settings window (native NSWindow via PyObjC)
+# ---------------------------------------------------------------------------
+
+_ptt_ref = None  # Module-level ref for ObjC delegate callbacks
+_SettingsDelegate = None
+
+
+def _get_delegate_class():
+    """Lazily create the NSObject subclass for settings window callbacks."""
+    global _SettingsDelegate
+    if _SettingsDelegate is not None:
+        return _SettingsDelegate
+
+    from Foundation import NSObject
+
+    class _SD(NSObject):
+        def langChanged_(self, sender):
+            if _ptt_ref:
+                idx = sender.indexOfSelectedItem()
+                codes = _ptt_ref._win_lang_codes
+                if 0 <= idx < len(codes):
+                    _ptt_ref._set_language(codes[idx])
+
+        def modelChanged_(self, sender):
+            if _ptt_ref:
+                idx = sender.indexOfSelectedItem()
+                keys = _ptt_ref._win_model_keys
+                if 0 <= idx < len(keys):
+                    _ptt_ref._set_model(keys[idx])
+
+        def hotkeyChanged_(self, sender):
+            if _ptt_ref:
+                idx = sender.indexOfSelectedItem()
+                keys = _ptt_ref._win_hotkey_keys
+                if 0 <= idx < len(keys):
+                    _ptt_ref._set_hotkey(keys[idx])
+
+        def autostartChanged_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._set_autostart(sender.state() == 1)
+
+        def calibrateClicked_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_recalibrate()
+
+        def editPromptClicked_(self, sender):
+            if _ptt_ref:
+                _ptt_ref._on_edit_prompt()
+
+    _SettingsDelegate = _SD
+    return _SettingsDelegate
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 
 class PTTApp:
@@ -458,17 +523,20 @@ class PTTApp:
         self._stream = None
         self._app = None
 
-        # Menu item references
+        # Menu item reference
         self._status_item = None
-        self._lang_items: dict = {}
-        self._model_items: dict = {}
-        self._hotkey_items: dict = {}
-        self._autostart_item = None
 
         # Icons
         self._icon_idle = None
         self._icon_rec: list = []
         self._icon_busy = None
+
+        # Settings window
+        self._settings_win = None
+        self._settings_delegate = None
+        self._win_lang_codes: list = []
+        self._win_model_keys: list = []
+        self._win_hotkey_keys: list = []
 
     # ---- Persistence -----------------------------------------------------
 
@@ -477,8 +545,8 @@ class PTTApp:
             "language": self.language,
             "model": self.model_key,
             "hotkey": self.hotkey,
-            "device": self.device_idx,
         })
+        # Don't persist auto-detected device — keep it as None for auto-detect
         save_settings(self.settings)
 
     # ---- Icons -----------------------------------------------------------
@@ -502,6 +570,9 @@ class PTTApp:
         import rumps
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
+        global _ptt_ref
+        _ptt_ref = self
+
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
@@ -509,65 +580,16 @@ class PTTApp:
         self._create_icons()
         ensure_prompt_file()
 
-        # Use text title initially — icon set after app loop starts
-        self._app = rumps.App("PTT", title="◉", quit_button=None)
+        self._app = rumps.App("PTT", title="PTT", quit_button=None)
 
-        self._status_item = rumps.MenuItem("Startar…")
+        self._status_item = rumps.MenuItem("Startar...")
 
-        # --- Language submenu ---
-        lang_menu = rumps.MenuItem("Språk")
-        available_langs = [("en", "English")]
-        if system_has_swedish():
-            available_langs.append(("sv", "Svenska"))
-        for code, label in available_langs:
-            item = rumps.MenuItem(label, callback=self._on_language)
-            item._lang_code = code
-            item.state = 1 if code == self.language else 0
-            self._lang_items[code] = item
-            lang_menu.add(item)
-
-        # --- Model submenu ---
-        model_menu = rumps.MenuItem("Modell")
-        for key, info in MODELS.items():
-            item = rumps.MenuItem(info["label"], callback=self._on_model)
-            item._model_key = key
-            item.state = 1 if key == self.model_key else 0
-            self._model_items[key] = item
-            model_menu.add(item)
-
-        # --- Hotkey submenu ---
-        hotkey_menu = rumps.MenuItem("Tangent")
-        for key, info in HOTKEYS.items():
-            item = rumps.MenuItem(info["label"], callback=self._on_hotkey)
-            item._hotkey_key = key
-            item.state = 1 if key == self.hotkey else 0
-            self._hotkey_items[key] = item
-            hotkey_menu.add(item)
-
-        # --- Autostart ---
-        self._autostart_item = rumps.MenuItem(
-            "Starta vid inloggning",
-            callback=self._on_autostart,
-        )
-        self._autostart_item.state = 1 if self.settings.get("autostart") else 0
-
-        # --- Settings submenu ---
-        settings_menu = rumps.MenuItem("Inställningar")
-        settings_menu.add(lang_menu)
-        settings_menu.add(model_menu)
-        settings_menu.add(hotkey_menu)
-        settings_menu.add(None)  # separator
-        settings_menu.add(self._autostart_item)
-        settings_menu.add(rumps.MenuItem("Redigera ordlista…", callback=self._on_edit_prompt))
-        settings_menu.add(rumps.MenuItem("Kalibrera mikrofon", callback=self._on_recalibrate))
-
-        # --- Top-level menu ---
         self._app.menu = [
             self._status_item,
             None,
-            settings_menu,
+            rumps.MenuItem("Installningar...", callback=self._on_open_settings),
+            rumps.MenuItem("Visa logg...", callback=self._on_open_log),
             None,
-            rumps.MenuItem("Visa logg…", callback=self._on_open_log),
             rumps.MenuItem("Avsluta", callback=self._on_quit),
         ]
 
@@ -575,14 +597,14 @@ class PTTApp:
         if not check_accessibility():
             log.warning("Accessibility permission missing")
             rumps.alert(
-                title="PTT behöver Accessibility",
+                title="PTT behover Accessibility",
                 message=(
-                    "PTT behöver behörighet för att läsa tangenter "
+                    "PTT behover behorighet for att lasa tangenter "
                     "och klistra in text.\n\n"
-                    "Lägg till appen i:\n"
-                    "Systeminställningar → Integritet och säkerhet → Hjälpmedel"
+                    "Lagg till appen i:\n"
+                    "Installningar > Integritet och sakerhet > Hjalpmedel"
                 ),
-                ok="Öppna inställningar",
+                ok="Oppna installningar",
             )
             subprocess.Popen([
                 "open",
@@ -627,12 +649,11 @@ class PTTApp:
         import sounddevice as sd
         from AppKit import NSEvent
 
-        # Wait for the app loop to create the NSStatusItem
         self._wait_for_statusitem()
 
         try:
             self._show_icon(self._icon_busy)
-            self._set_status("Laddar modell…")
+            self._set_status("Laddar modell...")
             log.info("Loading model: %s", self.model_repo)
 
             import mlx_whisper
@@ -678,10 +699,22 @@ class PTTApp:
 
             self.ready = True
             self._show_icon(self._icon_idle)
-            self._set_status(f"Mikrofon: {self.device_name}")
+            self._set_status(f"Redo | {self.device_name}")
             label = HOTKEYS[self.hotkey]["label"]
-            self._notify("Redo!", f"Håll {label} och prata")
             log.info("PTT ready")
+
+            # First-run intro
+            if not self.settings.get("intro_shown"):
+                self._notify(
+                    "Redo!",
+                    f"Hall {label} och prata.\n"
+                    "Slapp for att transkribera och klistra in.\n"
+                    "Klicka ikonen for installningar.",
+                )
+                self.settings["intro_shown"] = True
+                save_settings(self.settings)
+            else:
+                self._notify("Redo!", f"Hall {label} och prata")
 
         except Exception as e:
             log.exception("Init failed")
@@ -691,7 +724,7 @@ class PTTApp:
     def _calibrate(self):
         import sounddevice as sd
 
-        log.info("Calibrating…")
+        log.info("Calibrating...")
         rec = sd.rec(
             int(SAMPLE_RATE * CALIBRATION_SECONDS),
             samplerate=SAMPLE_RATE, channels=1, device=self.device_idx,
@@ -699,7 +732,7 @@ class PTTApp:
         sd.wait()
         ambient = float(np.sqrt(np.mean(rec ** 2)))
         self.silence_threshold = max(ambient * THRESHOLD_MULTIPLIER, MIN_THRESHOLD)
-        log.info("Ambient=%.5f → threshold=%.5f", ambient, self.silence_threshold)
+        log.info("Ambient=%.5f -> threshold=%.5f", ambient, self.silence_threshold)
 
     # ---- Hotkey ----------------------------------------------------------
 
@@ -818,44 +851,36 @@ class PTTApp:
             try:
                 paste_text(text + " ")
                 speed = duration / elapsed if elapsed > 0 else 0
-                log.info("Pasted %d chars  (%.1fs → %.1fs, %.0f×)", len(text), duration, elapsed, speed)
+                log.info("Pasted %d chars  (%.1fs -> %.1fs, %.0fx)", len(text), duration, elapsed, speed)
             except Exception:
-                log.exception("Paste failed — text in clipboard")
+                log.exception("Paste failed -- text in clipboard")
         else:
             log.info("Filtered hallucination")
 
         if self.recording:
             self._show_icon(self._icon_rec[0])
 
-    # ---- Settings callbacks ----------------------------------------------
+    # ---- Settings: internal setters --------------------------------------
 
-    def _on_language(self, sender):
-        code = sender._lang_code
+    def _set_language(self, code: str):
         if code == self.language:
             return
         self.language = code
-        for c, item in self._lang_items.items():
-            item.state = 1 if c == code else 0
         self._save()
-        label = "Svenska" if code == "sv" else "English"
-        log.info("Language → %s", code)
-        self._notify("Språk", label)
+        log.info("Language -> %s", code)
 
-    def _on_model(self, sender):
-        key = sender._model_key
+    def _set_model(self, key: str):
         if key == self.model_key:
             return
         self.model_key = key
         self.model_repo = MODELS[key]["repo"]
-        for k, item in self._model_items.items():
-            item.state = 1 if k == key else 0
         self._save()
-        log.info("Model → %s", key)
-        self._notify("Byter modell…", MODELS[key]["label"])
+        log.info("Model -> %s", key)
+        self._notify("Byter modell...", MODELS[key]["label"])
 
         def preload():
             self._show_icon(self._icon_busy)
-            self._set_status("Laddar modell…")
+            self._set_status("Laddar modell...")
             try:
                 import mlx_whisper
                 mlx_whisper.transcribe(
@@ -863,7 +888,7 @@ class PTTApp:
                     path_or_hf_repo=self.model_repo,
                     language=self.language,
                 )
-                self._set_status(f"Mikrofon: {self.device_name}")
+                self._set_status(f"Redo | {self.device_name}")
                 self._notify("Modell laddad", MODELS[key]["label"])
             except Exception as e:
                 log.exception("Model switch failed")
@@ -872,37 +897,194 @@ class PTTApp:
 
         threading.Thread(target=preload, daemon=True).start()
 
-    def _on_hotkey(self, sender):
-        key = sender._hotkey_key
+    def _set_hotkey(self, key: str):
         if key == self.hotkey:
             return
         self.hotkey = key
         hk = HOTKEYS[key]
         self.hotkey_code = hk["code"]
         self.hotkey_flag = hk["flag"]
-        for k, item in self._hotkey_items.items():
-            item.state = 1 if k == key else 0
         self._save()
-        log.info("Hotkey → %s", key)
-        self._notify("Tangent ändrad", hk["label"])
+        log.info("Hotkey -> %s", key)
+        self._notify("Tangent andrad", hk["label"])
 
-    def _on_autostart(self, sender):
-        enabled = not bool(sender.state)
-        sender.state = 1 if enabled else 0
+    def _set_autostart(self, enabled: bool):
         self.settings["autostart"] = enabled
         save_settings(self.settings)
         set_autostart(enabled)
-        msg = "PTT startar automatiskt vid inloggning" if enabled else "Autostart avstängd"
+        msg = "Startar automatiskt vid inloggning" if enabled else "Autostart avstangd"
         self._notify("Autostart", msg)
+
+    # ---- Settings window -------------------------------------------------
+
+    def _on_open_settings(self, _sender=None):
+        from AppKit import (
+            NSWindow, NSTextField, NSPopUpButton, NSButton,
+            NSFont, NSApp, NSBackingStoreBuffered, NSTextView,
+            NSScrollView, NSBorderlessWindowMask,
+        )
+        from Foundation import NSMakeRect
+
+        # Reuse existing window if visible
+        if self._settings_win and self._settings_win.isVisible():
+            self._settings_win.makeKeyAndOrderFront_(None)
+            NSApp.activateIgnoringOtherApps_(True)
+            return
+
+        DelegateCls = _get_delegate_class()
+        delegate = DelegateCls.alloc().init()
+        self._settings_delegate = delegate  # prevent GC
+
+        W, H = 400, 440
+        style = 1 | 2  # NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False
+        )
+        win.setTitle_("PTT -- Installningar")
+        win.center()
+
+        content = win.contentView()
+        y = H - 50
+        LX = 20       # label x
+        PX = 160      # popup x
+        PW = 210      # popup width
+
+        def add_label(text, x, yy, w=340, bold=False, size=12):
+            tf = NSTextField.alloc().initWithFrame_(NSMakeRect(x, yy, w, 18))
+            tf.setStringValue_(text)
+            tf.setBezeled_(False)
+            tf.setDrawsBackground_(False)
+            tf.setEditable_(False)
+            tf.setSelectable_(False)
+            if bold:
+                tf.setFont_(NSFont.boldSystemFontOfSize_(size))
+            else:
+                tf.setFont_(NSFont.systemFontOfSize_(size))
+            content.addSubview_(tf)
+            return tf
+
+        def add_popup(items, selected_idx, action_sel, yy):
+            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                NSMakeRect(PX, yy - 3, PW, 24), False
+            )
+            for title in items:
+                popup.addItemWithTitle_(title)
+            if 0 <= selected_idx < len(items):
+                popup.selectItemAtIndex_(selected_idx)
+            popup.setTarget_(delegate)
+            popup.setAction_(action_sel)
+            content.addSubview_(popup)
+            return popup
+
+        # --- Language ---
+        add_label("Sprak", LX, y)
+        self._win_lang_codes = []
+        lang_labels = []
+        available_langs = [("en", "English")]
+        if system_has_swedish():
+            available_langs.append(("sv", "Svenska"))
+        for code, lbl in available_langs:
+            self._win_lang_codes.append(code)
+            lang_labels.append(lbl)
+        try:
+            lang_idx = self._win_lang_codes.index(self.language)
+        except ValueError:
+            lang_idx = 0
+        add_popup(lang_labels, lang_idx, "langChanged:", y)
+
+        y -= 38
+
+        # --- Model ---
+        add_label("Modell", LX, y)
+        self._win_model_keys = []
+        model_labels = []
+        for key, info in MODELS.items():
+            self._win_model_keys.append(key)
+            model_labels.append(info["label"])
+        try:
+            model_idx = self._win_model_keys.index(self.model_key)
+        except ValueError:
+            model_idx = 0
+        add_popup(model_labels, model_idx, "modelChanged:", y)
+
+        y -= 38
+
+        # --- Hotkey ---
+        add_label("Tangent", LX, y)
+        self._win_hotkey_keys = []
+        hotkey_labels = []
+        for key, info in HOTKEYS.items():
+            self._win_hotkey_keys.append(key)
+            hotkey_labels.append(info["label"])
+        try:
+            hotkey_idx = self._win_hotkey_keys.index(self.hotkey)
+        except ValueError:
+            hotkey_idx = 0
+        add_popup(hotkey_labels, hotkey_idx, "hotkeyChanged:", y)
+
+        y -= 50
+
+        # --- Microphone ---
+        add_label("Mikrofon", LX, y, bold=True)
+        y -= 24
+        mic_text = self.device_name if self.device_name else "Inte initierad"
+        add_label(mic_text, LX, y, w=220)
+
+        cal_btn = NSButton.alloc().initWithFrame_(NSMakeRect(280, y - 4, 95, 28))
+        cal_btn.setTitle_("Kalibrera")
+        cal_btn.setBezelStyle_(1)  # rounded
+        cal_btn.setTarget_(delegate)
+        cal_btn.setAction_("calibrateClicked:")
+        content.addSubview_(cal_btn)
+
+        y -= 45
+
+        # --- Word hints ---
+        add_label("Ordlista", LX, y, bold=True)
+        y -= 24
+        add_label("Ord som Whisper ofta missar", LX, y, w=220)
+
+        edit_btn = NSButton.alloc().initWithFrame_(NSMakeRect(280, y - 4, 95, 28))
+        edit_btn.setTitle_("Redigera...")
+        edit_btn.setBezelStyle_(1)
+        edit_btn.setTarget_(delegate)
+        edit_btn.setAction_("editPromptClicked:")
+        content.addSubview_(edit_btn)
+
+        y -= 50
+
+        # --- Autostart ---
+        autostart_btn = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 300, 22))
+        autostart_btn.setButtonType_(3)  # switch/checkbox
+        autostart_btn.setTitle_("Starta PTT vid inloggning")
+        autostart_btn.setState_(1 if self.settings.get("autostart") else 0)
+        autostart_btn.setTarget_(delegate)
+        autostart_btn.setAction_("autostartChanged:")
+        content.addSubview_(autostart_btn)
+
+        y -= 40
+
+        # --- Footer ---
+        add_label(
+            "PTT -- lokal transkribering med MLX Whisper",
+            LX, y, w=360, size=10,
+        )
+
+        self._settings_win = win
+        win.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+
+    # ---- Action callbacks ------------------------------------------------
 
     def _on_edit_prompt(self, _sender=None):
         subprocess.Popen(["open", "-t", PROMPT_PATH])
 
     def _on_recalibrate(self, _sender=None):
         def do():
-            self._notify("Kalibrerar…", "Var tyst i 2 sekunder")
+            self._notify("Kalibrerar...", "Var tyst i 2 sekunder")
             self._calibrate()
-            self._notify("Klart!", f"Tröskel: {self.silence_threshold:.4f}")
+            self._notify("Klart!", f"Troskel: {self.silence_threshold:.4f}")
         threading.Thread(target=do, daemon=True).start()
 
     def _on_open_log(self, _sender=None):
@@ -916,6 +1098,12 @@ class PTTApp:
                 self._stream.stop()
             except Exception:
                 pass
+        # Clean up PID file
+        try:
+            if os.path.isfile(PID_PATH):
+                os.remove(PID_PATH)
+        except Exception:
+            pass
         rumps.quit_application()
 
 
@@ -944,13 +1132,12 @@ def list_devices():
 def main():
     parser = argparse.ArgumentParser(
         prog="ptt",
-        description="PTT — Push-to-Talk Transcription for macOS",
+        description="PTT -- Push-to-Talk Transcription for macOS",
     )
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--install", action="store_true", help="Auto-start on login")
     parser.add_argument("--uninstall", action="store_true", help="Remove auto-start")
     parser.add_argument("--reset", action="store_true", help="Reset settings")
-    # Override flags (optional, settings file is primary)
     parser.add_argument("--lang", default=None, metavar="CODE")
     parser.add_argument("--model", default=None, choices=list(MODELS))
     parser.add_argument("--key", default=None, choices=list(HOTKEYS))
@@ -984,7 +1171,6 @@ def main():
     _kill_other_instances()
 
     settings = load_settings()
-    # CLI overrides
     if args.lang:
         settings["language"] = args.lang
     if args.model:
