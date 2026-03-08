@@ -532,9 +532,6 @@ class PTTApp:
         self._stream = None
         self._app = None
 
-        # Menu item reference
-        self._status_item = None
-
         # Icons
         self._icon_idle = None
         self._icon_rec: list = []
@@ -591,11 +588,7 @@ class PTTApp:
 
         self._app = rumps.App("PTT", title="PTT", quit_button=None)
 
-        self._status_item = rumps.MenuItem("Startar…")
-
         self._app.menu = [
-            self._status_item,
-            None,
             rumps.MenuItem("Inställningar…", callback=self._on_open_settings),
             rumps.MenuItem("Visa logg…", callback=self._on_open_log),
             None,
@@ -623,18 +616,6 @@ class PTTApp:
 
         threading.Thread(target=self._init, daemon=True).start()
         self._app.run()
-
-    def _set_status(self, text: str):
-        try:
-            if not self._status_item:
-                return
-            # NSMenuItem.setTitle_ must be called on the main thread
-            mi = self._status_item._menuitem
-            mi.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "setTitle:", text, False
-            )
-        except Exception as e:
-            log.debug("_set_status failed: %s", e)
 
     def _notify(self, title: str, message: str):
         try:
@@ -667,7 +648,7 @@ class PTTApp:
 
         try:
             self._show_icon(self._icon_busy)
-            self._set_status("Laddar modell…")
+
             log.info("Loading model: %s", self.model_repo)
 
             import mlx_whisper
@@ -713,7 +694,7 @@ class PTTApp:
 
             self.ready = True
             self._show_icon(self._icon_idle)
-            self._set_status(f"Redo | {self.device_name}")
+
             label = HOTKEYS[self.hotkey]["label"]
             log.info("PTT ready")
 
@@ -732,7 +713,7 @@ class PTTApp:
 
         except Exception as e:
             log.exception("Init failed")
-            self._set_status(f"Fel: {e}")
+            pass  # error already logged and notified
             self._notify("Kunde inte starta", str(e))
 
     def _calibrate(self):
@@ -894,7 +875,7 @@ class PTTApp:
 
         def preload():
             self._show_icon(self._icon_busy)
-            self._set_status("Laddar modell…")
+
             try:
                 import mlx_whisper
                 mlx_whisper.transcribe(
@@ -902,7 +883,7 @@ class PTTApp:
                     path_or_hf_repo=self.model_repo,
                     language=self.language,
                 )
-                self._set_status(f"Redo | {self.device_name}")
+    
                 self._notify("Modell laddad", model_label(key))
             except Exception as e:
                 log.exception("Model switch failed")
