@@ -96,16 +96,28 @@ for _name in ("httpx", "huggingface_hub", "tqdm"):
 # ---------------------------------------------------------------------------
 
 MODELS = {
-    "turbo": {
-        "repo": "mlx-community/whisper-large-v3-turbo",
-        "label_sv": "Turbo — snabb, alla språk",
-        "label_en": "Turbo — fast, all languages",
+    "kb-sm": {
+        "repo": "Leonidng/kb-whisper-small-mlx",
+        "label_sv": "KB Small — snabb svenska",
+        "label_en": "KB Small — fast Swedish",
+        "swedish_only": True,
+    },
+    "small": {
+        "repo": "mlx-community/whisper-small-mlx",
+        "label_sv": "Small — alla språk",
+        "label_en": "Small — all languages",
         "swedish_only": False,
     },
-    "kb-sv": {
+    "turbo": {
+        "repo": "mlx-community/whisper-large-v3-turbo",
+        "label_sv": "Turbo — bäst kvalitet",
+        "label_en": "Turbo — best quality",
+        "swedish_only": False,
+    },
+    "kb-lg": {
         "repo": "bratland/kb-whisper-large-mlx",
-        "label_sv": "KB Swedish — bäst på svenska",
-        "label_en": "KB Swedish — best for Swedish",
+        "label_sv": "KB Large — bäst på svenska",
+        "label_en": "KB Large — best Swedish",
         "swedish_only": True,
     },
 }
@@ -164,7 +176,7 @@ WAVE_BUSY = [0.25, 0.50, 0.25, 0.50, 0.25]
 
 _DEFAULT_SETTINGS = {
     "language": None,  # auto-detect
-    "model": "turbo",
+    "model": "kb-sm",
     "hotkey": "alt_r",
     "device": None,
     "autostart": False,
@@ -210,6 +222,11 @@ def load_settings() -> dict:
             pass
     if settings["language"] is None:
         settings["language"] = detect_system_language()
+    # Migrate old model keys
+    if settings["model"] == "kb-sv":
+        settings["model"] = "kb-sm"
+    if settings["model"] not in MODELS:
+        settings["model"] = _DEFAULT_SETTINGS["model"]
     return settings
 
 

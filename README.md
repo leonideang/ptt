@@ -119,8 +119,10 @@ ptt --reset                  # Reset all settings
 
 | Key | Model | Size | Speed | Best for |
 |-----|-------|------|-------|----------|
-| `turbo` | whisper-large-v3-turbo | 809 MB | ~1s/chunk | General use, all languages |
-| `kb-sv` | KB Whisper Large | 1.5 GB | ~2s/chunk | Swedish accuracy |
+| `kb-sm` | KB Whisper Small (default) | 459 MB | ~0.5s/chunk | Swedish — fast and accurate |
+| `small` | Whisper Small | 461 MB | ~0.5s/chunk | All languages |
+| `turbo` | Whisper Large v3 Turbo | 809 MB | ~1s/chunk | Best quality, all languages |
+| `kb-lg` | KB Whisper Large | 1.5 GB | ~2s/chunk | Best Swedish accuracy |
 
 Switch models from Settings — no restart needed.
 
