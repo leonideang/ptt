@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import shutil
 import subprocess
 import threading
@@ -46,6 +47,7 @@ SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 PROMPT_PATH = os.path.join(CONFIG_DIR, "prompt.txt")
 LOG_DIR = os.path.expanduser("~/Library/Logs")
 LOG_PATH = os.path.join(LOG_DIR, "ptt.log")
+PID_PATH = os.path.join(CONFIG_DIR, "ptt.pid")
 LAUNCHAGENT_LABEL = "com.ptt.transcription"
 PLIST_PATH = os.path.expanduser(
     f"~/Library/LaunchAgents/{LAUNCHAGENT_LABEL}.plist"
@@ -64,11 +66,14 @@ try:
 except Exception:
     pass
 
+_log_handlers = [logging.FileHandler(LOG_PATH)]
+if os.isatty(2):  # Only add stderr handler when running in a terminal
+    _log_handlers.append(logging.StreamHandler())
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s  %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
+    handlers=_log_handlers,
 )
 log = logging.getLogger("ptt")
 
@@ -405,6 +410,26 @@ def set_autostart(enabled: bool):
 # ---------------------------------------------------------------------------
 
 
+def _kill_other_instances():
+    """Kill any previous PTT instance using a PID file."""
+    # Kill previous instance from PID file
+    if os.path.isfile(PID_PATH):
+        try:
+            old_pid = int(open(PID_PATH).read().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, signal.SIGTERM)
+                log.info("Killed previous PTT process %d", old_pid)
+                time.sleep(0.5)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        except Exception:
+            pass
+
+    # Write our PID
+    with open(PID_PATH, "w") as f:
+        f.write(str(os.getpid()))
+
+
 class PTTApp:
     def __init__(self, settings: dict):
         self.settings = settings
@@ -468,8 +493,8 @@ class PTTApp:
             b = self._app._nsapp.nsstatusitem.button()
             b.setImage_(nsimage)
             b.setTitle_("")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("_show_icon failed: %s", e)
 
     # ---- Menu ------------------------------------------------------------
 
@@ -584,12 +609,26 @@ class PTTApp:
 
     # ---- Init ------------------------------------------------------------
 
+    def _wait_for_statusitem(self, timeout: float = 10.0):
+        """Poll until rumps has created the NSStatusItem."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                si = self._app._nsapp.nsstatusitem
+                if si and si.button():
+                    return True
+            except AttributeError:
+                pass
+            time.sleep(0.1)
+        log.warning("Timed out waiting for NSStatusItem")
+        return False
+
     def _init(self):
         import sounddevice as sd
         from AppKit import NSEvent
 
         # Wait for the app loop to create the NSStatusItem
-        time.sleep(0.5)
+        self._wait_for_statusitem()
 
         try:
             self._show_icon(self._icon_busy)
@@ -941,6 +980,8 @@ def main():
             os.remove(SETTINGS_PATH)
         print("  Settings reset to defaults.")
         return
+
+    _kill_other_instances()
 
     settings = load_settings()
     # CLI overrides
