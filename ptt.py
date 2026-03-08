@@ -1023,6 +1023,9 @@ class PTTApp:
             if prompt:
                 log.info("Prompt: %s", prompt[:80])
 
+            # Start mic device monitor
+            threading.Thread(target=self._monitor_mic, daemon=True).start()
+
             self.ready = True
             self._show_icon(self._icon_idle)
 
@@ -1074,6 +1077,35 @@ class PTTApp:
         ambient = float(np.sqrt(np.mean(rec ** 2)))
         self.silence_threshold = max(ambient * THRESHOLD_MULTIPLIER, MIN_THRESHOLD)
         log.info("Ambient=%.5f -> threshold=%.5f", ambient, self.silence_threshold)
+
+    def _monitor_mic(self):
+        """Poll for default input device changes every 5s."""
+        import sounddevice as sd
+        last_default = sd.default.device[0]
+        while True:
+            time.sleep(5)
+            try:
+                cur = sd.default.device[0]
+                if cur != last_default and not self.recording:
+                    last_default = cur
+                    new_name = sd.query_devices(cur)["name"]
+                    log.info("Mic changed: %s (device %d)", new_name, cur)
+                    self.device_idx = cur
+                    self.device_name = new_name
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = self._create_stream()
+                    self._stream.start()
+                    self._calibrate()
+                    self._notify(
+                        _t("Mikrofon bytt", "Microphone switched"),
+                        new_name,
+                    )
+            except Exception:
+                pass
 
     # ---- Hotkey ----------------------------------------------------------
 
