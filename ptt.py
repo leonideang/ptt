@@ -133,9 +133,9 @@ def model_label(key: str) -> str:
 
 SAMPLE_RATE = 16000
 BLOCK_DURATION = 0.1
-MIN_SPEECH_SECONDS = 0.5
-PAUSE_SECONDS = 0.8
-PRE_ROLL_SECONDS = 0.4
+MIN_SPEECH_SECONDS = 0.3
+PAUSE_SECONDS = 1.0
+PRE_ROLL_SECONDS = 0.5
 CALIBRATION_SECONDS = 2.0
 THRESHOLD_MULTIPLIER = 3.0
 MIN_THRESHOLD = 0.002
@@ -1340,6 +1340,7 @@ class PTTApp:
         frame = 0
         polish_parts: list[str] = []
         empty_polls = 0
+        prev_text = ""  # context for cross-chunk continuity
 
         while self.recording:
             try:
@@ -1368,15 +1369,30 @@ class PTTApp:
                 speech_buf.append(block)
                 silent_blocks += 1
                 if silent_blocks * BLOCK_DURATION >= PAUSE_SECONDS:
-                    text = self._transcribe(list(speech_buf))
+                    text = self._transcribe(list(speech_buf), prev_text)
+                    if text:
+                        prev_text = text
                     if self.polish_mode and text:
                         polish_parts.append(text)
                     speech_buf.clear()
                     silent_blocks = 0
                     has_speech = False
 
+        # Drain any audio blocks that arrived while _transcribe was blocking
+        while not self.audio_queue.empty():
+            try:
+                block = self.audio_queue.get_nowait()
+                rms = float(np.sqrt(np.mean(block ** 2)))
+                if rms > self.silence_threshold:
+                    speech_buf.append(block)
+                    has_speech = True
+                elif has_speech:
+                    speech_buf.append(block)
+            except queue.Empty:
+                break
+
         if speech_buf and has_speech:
-            text = self._transcribe(speech_buf)
+            text = self._transcribe(speech_buf, prev_text)
             if self.polish_mode and text:
                 polish_parts.append(text)
 
@@ -1403,7 +1419,7 @@ class PTTApp:
 
     # ---- Transcription ---------------------------------------------------
 
-    def _transcribe(self, blocks):
+    def _transcribe(self, blocks, prev_text=""):
         audio = np.concatenate(blocks).flatten().astype(np.float32)
         duration = len(audio) / SAMPLE_RATE
         if duration < MIN_SPEECH_SECONDS:
@@ -1413,9 +1429,14 @@ class PTTApp:
         t0 = time.monotonic()
 
         kwargs = {"language": self.language}
+        prompt_parts = []
         prompt = read_prompt()
         if prompt:
-            kwargs["initial_prompt"] = prompt
+            prompt_parts.append(prompt)
+        if prev_text:
+            prompt_parts.append(prev_text[-200:])
+        if prompt_parts:
+            kwargs["initial_prompt"] = " ".join(prompt_parts)
 
         result = self._worker.transcribe(audio, self.model_repo, **kwargs)
         if result is None:
