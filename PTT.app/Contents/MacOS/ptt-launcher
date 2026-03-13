@@ -1,6 +1,6 @@
 #!/bin/bash
 # PTT — Push-to-Talk Transcription launcher
-# This script finds uv and runs ptt.py
+# This script finds or installs uv, then runs ptt.py
 
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 
@@ -9,14 +9,26 @@ UV=""
 for p in "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv" "/opt/homebrew/bin/uv" "/usr/local/bin/uv"; do
     [ -x "$p" ] && UV="$p" && break
 done
+[ -z "$UV" ] && UV="$(which uv 2>/dev/null)"
 
 if [ -z "$UV" ]; then
-    UV="$(which uv 2>/dev/null)"
-fi
+    # Offer to install uv automatically
+    CHOICE=$(osascript -e '
+        display dialog "PTT behöver \"uv\" för att köra.\n\nVill du installera det nu? (tar ~5 sekunder)" buttons {"Avbryt", "Installera"} default button "Installera" with title "PTT" with icon caution
+        button returned of result
+    ' 2>/dev/null)
 
-if [ -z "$UV" ]; then
-    osascript -e 'display alert "PTT" message "uv is required but not installed.\n\nInstall with:\nbrew install uv\n\nOr visit: https://docs.astral.sh/uv/" as warning'
-    exit 1
+    if [ "$CHOICE" = "Installera" ]; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null
+        for p in "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
+            [ -x "$p" ] && UV="$p" && break
+        done
+    fi
+
+    if [ -z "$UV" ]; then
+        osascript -e 'display alert "PTT" message "Kunde inte installera uv.\n\nInstallera manuellt:\nbrew install uv" as warning'
+        exit 1
+    fi
 fi
 
 export UV_HTTP_TIMEOUT=300

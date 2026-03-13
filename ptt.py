@@ -353,21 +353,29 @@ def find_builtin_mic() -> tuple[int | None, str]:
     return None, "Unknown"
 
 
+_paste_generation = 0
+
+
 def paste_text(text: str, restore_clipboard: bool = True):
+    global _paste_generation
     from AppKit import NSPasteboard, NSPasteboardTypeString
     from Quartz import (
         CGEventCreateKeyboardEvent, CGEventPost,
         CGEventSetFlags, kCGEventFlagMaskCommand, kCGHIDEventTap,
     )
 
+    _paste_generation += 1
+    gen = _paste_generation
+
     pb = NSPasteboard.generalPasteboard()
 
-    # Save current clipboard
+    # Save current clipboard before overwriting
     old_contents = None
     if restore_clipboard:
         old_contents = pb.stringForType_(NSPasteboardTypeString)
 
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+    pb.clearContents()
+    pb.setString_forType_(text, NSPasteboardTypeString)
     time.sleep(0.03)
     for pressed in (True, False):
         ev = CGEventCreateKeyboardEvent(None, 9, pressed)
@@ -376,10 +384,12 @@ def paste_text(text: str, restore_clipboard: bool = True):
         if pressed:
             time.sleep(0.03)
 
-    # Restore clipboard after paste lands
+    # Restore clipboard after paste lands (skipped if a newer paste arrived)
     if restore_clipboard and old_contents is not None:
         def _restore():
-            time.sleep(0.2)
+            time.sleep(0.3)
+            if _paste_generation != gen:
+                return  # a newer paste superseded this one
             pb.clearContents()
             pb.setString_forType_(old_contents, NSPasteboardTypeString)
         threading.Thread(target=_restore, daemon=True).start()
@@ -774,6 +784,154 @@ def _get_delegate_class():
 
 
 # ---------------------------------------------------------------------------
+# Transcription subprocess
+# ---------------------------------------------------------------------------
+
+
+def _transcription_worker_main(model_repo: str, language: str, conn):
+    """Worker process: loads the Whisper model and handles transcription requests.
+    Runs in a separate subprocess so the model memory can be released when idle.
+    """
+    import mlx_whisper
+
+    mlx_whisper.transcribe(
+        np.zeros(SAMPLE_RATE, dtype=np.float32),
+        path_or_hf_repo=model_repo,
+        language=language,
+    )
+    conn.send({"status": "ready"})
+
+    while True:
+        try:
+            req = conn.recv()
+        except (EOFError, OSError):
+            break
+        if req is None:
+            break
+        audio, kwargs = req
+        try:
+            result = mlx_whisper.transcribe(audio, path_or_hf_repo=model_repo, **kwargs)
+            conn.send({"status": "ok", "result": result})
+        except Exception as e:
+            conn.send({"status": "error", "error": str(e)})
+
+
+class TranscriptionProcess:
+    """Manages a Whisper model in a subprocess for memory isolation.
+
+    The subprocess starts on first use and is killed automatically after
+    IDLE_TIMEOUT seconds of inactivity, freeing model memory. It restarts
+    automatically on next use. Model switches kill the old process first,
+    so only one model is ever in memory.
+    """
+
+    IDLE_TIMEOUT = 5 * 60  # seconds
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc = None
+        self._conn = None
+        self._model_repo = None
+        self._idle_timer = None
+
+    def warm_up(self, model_repo: str, language: str):
+        """Pre-load the model (blocks until ready). Restarts if model changed."""
+        with self._lock:
+            if self._proc is not None and self._proc.is_alive() and self._model_repo == model_repo:
+                return
+            self._start(model_repo, language)
+
+    def transcribe(self, audio, model_repo: str, **kwargs):
+        """Send audio to worker and return result dict, or None on error."""
+        self._cancel_idle_timer()
+        with self._lock:
+            if self._proc is None or not self._proc.is_alive() or self._model_repo != model_repo:
+                language = kwargs.get("language", "en")
+                try:
+                    self._start(model_repo, language)
+                except Exception as e:
+                    log.error("Failed to start transcription worker: %s", e)
+                    return None
+            try:
+                self._conn.send((audio, kwargs))
+                msg = self._conn.recv()
+            except Exception as e:
+                log.error("Transcription IPC error: %s", e)
+                self._kill()
+                return None
+        self._schedule_idle_timer()
+        if msg and msg.get("status") == "ok":
+            return msg["result"]
+        log.error("Worker error: %s", msg.get("error") if msg else "no response")
+        return None
+
+    def stop(self):
+        """Stop the worker subprocess and release model memory."""
+        self._cancel_idle_timer()
+        with self._lock:
+            self._kill()
+
+    def _start(self, model_repo: str, language: str):
+        """Launch a new worker subprocess. Must be called with _lock held."""
+        self._kill()
+        import multiprocessing
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        proc = ctx.Process(
+            target=_transcription_worker_main,
+            args=(model_repo, language, child_conn),
+            daemon=True,
+        )
+        proc.start()
+        child_conn.close()
+        try:
+            msg = parent_conn.recv()
+        except Exception as e:
+            proc.terminate()
+            raise RuntimeError(f"Worker startup error: {e}") from e
+        if not msg or msg.get("status") != "ready":
+            proc.terminate()
+            raise RuntimeError(f"Worker not ready: {msg}")
+        self._proc = proc
+        self._conn = parent_conn
+        self._model_repo = model_repo
+        log.info("Transcription worker ready (%s)", model_repo)
+
+    def _kill(self):
+        """Terminate the subprocess. Must be called with _lock held."""
+        if self._proc and self._proc.is_alive():
+            try:
+                self._conn.send(None)
+            except Exception:
+                pass
+            self._proc.join(timeout=3)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2)
+            log.info("Transcription worker stopped — model memory freed")
+        self._proc = None
+        self._conn = None
+        self._model_repo = None
+
+    def _schedule_idle_timer(self):
+        self._cancel_idle_timer()
+        t = threading.Timer(self.IDLE_TIMEOUT, self._on_idle)
+        t.daemon = True
+        t.start()
+        self._idle_timer = t
+
+    def _cancel_idle_timer(self):
+        t, self._idle_timer = self._idle_timer, None
+        if t:
+            t.cancel()
+
+    def _on_idle(self):
+        log.info("No activity for %d min — unloading model to free memory", self.IDLE_TIMEOUT // 60)
+        with self._lock:
+            self._kill()
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -822,6 +980,7 @@ class PTTApp:
         self._groq_status_label = None
         self._polish_prompt_tv = None
         self._history: collections.deque = collections.deque(maxlen=10)
+        self._worker = TranscriptionProcess()
 
     # ---- Persistence -----------------------------------------------------
 
@@ -866,29 +1025,35 @@ class PTTApp:
         self._update_history_menu()
 
     def _update_history_menu(self):
-        import rumps
-        try:
-            menu = self._app.menu
-            # Remove old history submenu if present
-            hist_key = _t("Senaste", "Recent")
-            if hist_key in menu:
-                del menu[hist_key]
-            if not self._history:
-                return
-            sub = rumps.MenuItem(hist_key)
-            for text in self._history:
-                display = (text[:55] + "…") if len(text) > 55 else text
-                item = rumps.MenuItem(display, callback=self._make_copy_cb(text))
-                sub[display] = item
-            # Insert after first item (Settings)
-            menu.insert_after(_t("Inställningar…", "Settings…"), sub)
-        except Exception:
-            log.debug("History menu update failed", exc_info=True)
+        from PyObjCTools import AppHelper
+
+        def _do_update():
+            import rumps
+            try:
+                menu = self._app.menu
+                hist_key = _t("Senaste", "Recent")
+                if hist_key in menu:
+                    del menu[hist_key]
+                if not self._history:
+                    return
+                sub = rumps.MenuItem(hist_key)
+                for text in list(self._history):
+                    display = (text[:55] + "…") if len(text) > 55 else text
+                    item = rumps.MenuItem(display, callback=self._make_copy_cb(text))
+                    sub[display] = item
+                menu.insert_after(_t("Inställningar…", "Settings…"), sub)
+            except Exception:
+                log.debug("History menu update failed", exc_info=True)
+
+        AppHelper.callAfter(_do_update)
 
     def _make_copy_cb(self, text: str):
         def cb(_):
-            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-            self._notify(_t("Kopierat", "Copied"), (text[:60] + "…") if len(text) > 60 else text)
+            from AppKit import NSPasteboard, NSPasteboardTypeString
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(text, NSPasteboardTypeString)
+            self._notify(_t("Kopierat", "Copied"), (text[:55] + "…") if len(text) > 55 else text)
         return cb
 
     def _show_icon(self, nsimage):
@@ -987,13 +1152,7 @@ class PTTApp:
             self._show_icon(self._icon_busy)
 
             log.info("Loading model: %s", self.model_repo)
-
-            import mlx_whisper
-            mlx_whisper.transcribe(
-                np.zeros(SAMPLE_RATE, dtype=np.float32),
-                path_or_hf_repo=self.model_repo,
-                language=self.language,
-            )
+            self._worker.warm_up(self.model_repo, self.language)
             log.info("Model loaded")
 
             if self.device_idx is not None:
@@ -1104,8 +1263,10 @@ class PTTApp:
                         _t("Mikrofon bytt", "Microphone switched"),
                         new_name,
                     )
+            except (sd.PortAudioError, OSError) as e:
+                log.debug("Mic monitor error: %s", e)
             except Exception:
-                pass
+                log.exception("Unexpected mic monitor error")
 
     # ---- Hotkey ----------------------------------------------------------
 
@@ -1243,8 +1404,6 @@ class PTTApp:
     # ---- Transcription ---------------------------------------------------
 
     def _transcribe(self, blocks):
-        import mlx_whisper
-
         audio = np.concatenate(blocks).flatten().astype(np.float32)
         duration = len(audio) / SAMPLE_RATE
         if duration < MIN_SPEECH_SECONDS:
@@ -1253,18 +1412,13 @@ class PTTApp:
         self._show_icon(self._icon_busy)
         t0 = time.monotonic()
 
-        kwargs = {
-            "path_or_hf_repo": self.model_repo,
-            "language": self.language,
-        }
+        kwargs = {"language": self.language}
         prompt = read_prompt()
         if prompt:
             kwargs["initial_prompt"] = prompt
 
-        try:
-            result = mlx_whisper.transcribe(audio, **kwargs)
-        except Exception:
-            log.exception("Transcription error")
+        result = self._worker.transcribe(audio, self.model_repo, **kwargs)
+        if result is None:
             if self.recording:
                 self._show_icon(self._icon_rec[0])
             return None
@@ -1313,13 +1467,7 @@ class PTTApp:
             self._show_icon(self._icon_busy)
 
             try:
-                import mlx_whisper
-                mlx_whisper.transcribe(
-                    np.zeros(SAMPLE_RATE, dtype=np.float32),
-                    path_or_hf_repo=self.model_repo,
-                    language=self.language,
-                )
-    
+                self._worker.warm_up(self.model_repo, self.language)
                 self._notify(_t("Modell laddad", "Model loaded"), model_label(key))
             except Exception as e:
                 log.exception("Model switch failed")
@@ -1344,14 +1492,12 @@ class PTTApp:
         save_settings(self.settings)
 
     def _set_logging(self, enabled: bool):
-        self.settings["logging"] = enabled
-        save_settings(self.settings)
+        self._set_setting("logging", enabled)
         set_logging_enabled(enabled)
         log.info("Logging -> %s", "on" if enabled else "off")
 
     def _set_autostart(self, enabled: bool):
-        self.settings["autostart"] = enabled
-        save_settings(self.settings)
+        self._set_setting("autostart", enabled)
         set_autostart(enabled)
         msg = _t(
             "Startar automatiskt vid inloggning" if enabled else "Autostart avstängd",
@@ -1434,6 +1580,16 @@ class PTTApp:
             btn.setAction_(action_sel)
             content.addSubview_(btn)
             return btn
+
+        def add_checkbox(title, yy, checked, action_sel):
+            chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, yy, 350, 22))
+            chk.setButtonType_(3)
+            chk.setTitle_(title)
+            chk.setState_(1 if checked else 0)
+            chk.setTarget_(delegate)
+            chk.setAction_(action_sel)
+            content.addSubview_(chk)
+            return chk
 
         def add_separator(yy):
             sep = NSBox.alloc().initWithFrame_(NSMakeRect(LX, yy, W - 40, 1))
@@ -1595,51 +1751,26 @@ class PTTApp:
         add_label(_t("Övrigt", "General"), LX, y, bold=True, size=13)
         y -= 28
 
-        autostart_btn = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 300, 22))
-        autostart_btn.setButtonType_(3)  # checkbox
-        autostart_btn.setTitle_(_t("Starta PTT vid inloggning", "Start PTT at login"))
-        autostart_btn.setState_(1 if self.settings.get("autostart") else 0)
-        autostart_btn.setTarget_(delegate)
-        autostart_btn.setAction_("autostartChanged:")
-        content.addSubview_(autostart_btn)
+        add_checkbox(_t("Starta PTT vid inloggning", "Start PTT at login"),
+                    y, self.settings.get("autostart"), "autostartChanged:")
         y -= 26
 
-        log_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 250, 22))
-        log_chk.setButtonType_(3)  # checkbox
-        log_chk.setTitle_(_t("Logga till fil", "Log to file"))
-        log_chk.setState_(1 if self.settings.get("logging", True) else 0)
-        log_chk.setTarget_(delegate)
-        log_chk.setAction_("loggingChanged:")
-        content.addSubview_(log_chk)
+        add_checkbox(_t("Logga till fil", "Log to file"),
+                    y, self.settings.get("logging", True), "loggingChanged:")
         add_btn(_t("Rensa", "Clear"), y, "clearLog:", x=BX - 60, w=70)
         add_btn(_t("Visa", "View"), y, "openLog:", x=BX + 20, w=70)
         y -= 26
 
-        clip_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 350, 22))
-        clip_chk.setButtonType_(3)
-        clip_chk.setTitle_(_t("Återställ urklipp efter inklistring", "Restore clipboard after paste"))
-        clip_chk.setState_(1 if self.settings.get("restore_clipboard", True) else 0)
-        clip_chk.setTarget_(delegate)
-        clip_chk.setAction_("clipboardChanged:")
-        content.addSubview_(clip_chk)
+        add_checkbox(_t("Återställ urklipp efter inklistring", "Restore clipboard after paste"),
+                    y, self.settings.get("restore_clipboard", True), "clipboardChanged:")
         y -= 26
 
-        sound_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 350, 22))
-        sound_chk.setButtonType_(3)
-        sound_chk.setTitle_(_t("Ljudfeedback vid inspelning", "Sound feedback when recording"))
-        sound_chk.setState_(1 if self.settings.get("sounds", False) else 0)
-        sound_chk.setTarget_(delegate)
-        sound_chk.setAction_("soundsChanged:")
-        content.addSubview_(sound_chk)
+        add_checkbox(_t("Ljudfeedback vid inspelning", "Sound feedback when recording"),
+                    y, self.settings.get("sounds", False), "soundsChanged:")
         y -= 26
 
-        hist_chk = NSButton.alloc().initWithFrame_(NSMakeRect(LX, y, 350, 22))
-        hist_chk.setButtonType_(3)
-        hist_chk.setTitle_(_t("Visa senaste transkriptioner i menyn", "Show recent transcriptions in menu"))
-        hist_chk.setState_(1 if self.settings.get("history", True) else 0)
-        hist_chk.setTarget_(delegate)
-        hist_chk.setAction_("historyChanged:")
-        content.addSubview_(hist_chk)
+        add_checkbox(_t("Visa senaste transkriptioner i menyn", "Show recent transcriptions in menu"),
+                    y, self.settings.get("history", True), "historyChanged:")
 
         y -= 30
 
@@ -1740,6 +1871,7 @@ class PTTApp:
     def _on_quit(self, _sender=None):
         import rumps
         self.recording = False
+        self._worker.stop()
         if self._stream:
             try:
                 self._stream.stop()
