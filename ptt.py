@@ -1545,7 +1545,7 @@ class PTTApp:
         delegate = DelegateCls.alloc().init()
         self._settings_delegate = delegate  # prevent GC
 
-        W, H = 420, 840
+        W, H = 420, 870
         style = 1 | 2  # NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -1730,15 +1730,15 @@ class PTTApp:
             )
             add_btn(_t("Ta bort", "Remove"), y, "removeGroqKey:")
         else:
-            key_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(PX, y - 2, 110, 24))
+            key_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(PX, y - 2, 150, 24))
             key_field.setPlaceholderString_("gsk_...")
             key_field.setFont_(NSFont.systemFontOfSize_(11))
             content.addSubview_(key_field)
             self._groq_key_field = key_field
-            add_btn(_t("Spara", "Save"), y, "saveGroqKey:")
+            add_btn(_t("Spara", "Save"), y, "saveGroqKey:", x=PX + 160, w=60)
         y -= 30
 
-        # Polish prompt — collapsible inline editor
+        # Polish prompt — inline editor
         add_label(_t("Prompt", "Prompt"), LX, y)
         add_label(
             _t("Instruktioner till AI:n", "Instructions for the AI"),
@@ -1747,22 +1747,31 @@ class PTTApp:
         y -= 24
 
         from AppKit import NSTextView, NSScrollView
-        prompt_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(LX, y - 70, W - 40, 74))
+        prompt_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(LX, y - 80, W - 40, 84))
         prompt_scroll.setHasVerticalScroller_(True)
         prompt_scroll.setBorderType_(3)  # NSBezelBorder
-        prompt_tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 58, 70))
+        prompt_tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 58, 80))
         prompt_tv.setFont_(NSFont.systemFontOfSize_(11))
         prompt_tv.setEditable_(True)
         prompt_tv.setRichText_(False)
-        # Load current prompt
+        # Show active prompt (custom if set, otherwise default)
         current_prompt = _read_commented_file(POLISH_PROMPT_PATH, sep=" ") or ""
-        prompt_tv.setString_(current_prompt)
+        if current_prompt:
+            prompt_tv.setString_(current_prompt)
+        else:
+            prompt_tv.setString_(_read_polish_prompt(self.language))
+            prompt_tv.setTextColor_(NSColor.placeholderTextColor())
         prompt_scroll.setDocumentView_(prompt_tv)
         content.addSubview_(prompt_scroll)
         self._polish_prompt_tv = prompt_tv
-        y -= 80
+        y -= 90
 
         add_btn(_t("Spara prompt", "Save prompt"), y, "savePolishPrompt:", x=LX, w=120)
+        add_label(
+            _t("Rensa texten för att återställa standardprompt",
+               "Clear the text to restore default prompt"),
+            LX + 128, y + 4, w=240, size=10, color=ter,
+        )
 
         y -= 20
         add_separator(y)
@@ -1820,12 +1829,26 @@ class PTTApp:
         if not self._polish_prompt_tv:
             return
         text = str(self._polish_prompt_tv.string()).strip()
-        with open(POLISH_PROMPT_PATH, "w") as f:
-            f.write(text + "\n")
-        self._notify(
-            _t("Prompt sparad", "Prompt saved"),
-            _t("Poleringsprompt uppdaterad", "Polish prompt updated"),
-        )
+        default = _read_polish_prompt(self.language)
+        if not text or text == default:
+            # Clear custom prompt → use default
+            _ensure_polish_prompt_file()
+            self._polish_prompt_tv.setString_(default)
+            from AppKit import NSColor
+            self._polish_prompt_tv.setTextColor_(NSColor.placeholderTextColor())
+            self._notify(
+                _t("Standardprompt", "Default prompt"),
+                _t("Använder standardprompt", "Using default prompt"),
+            )
+        else:
+            with open(POLISH_PROMPT_PATH, "w") as f:
+                f.write(text + "\n")
+            from AppKit import NSColor
+            self._polish_prompt_tv.setTextColor_(NSColor.labelColor())
+            self._notify(
+                _t("Prompt sparad", "Prompt saved"),
+                _t("Poleringsprompt uppdaterad", "Polish prompt updated"),
+            )
 
     def _on_clear_log(self, _sender=None):
         try:
